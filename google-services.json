@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "98433135842",
+    "project_id": "uas-mobile-bf254",
+    "storage_bucket": "uas-mobile-bf254.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:98433135842:android:6b9d2972f8c613640d1abb",
+        "android_client_info": {
+          "package_name": "com.anonymous.uasmobile"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAXWDnpfGi7XlpjVUySFltrCRXF1756B-Q"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -1,0 +1,12 @@
+{
+  "java.import.exclusions": [
+    "**/node_modules/**",
+    "**/android/build/**",
+    "**/.gradle/**"
+  ],
+  "files.watcherExclude": {
+    "**/node_modules/**": true,
+    "**/android/build/**": true,
+    "**/.gradle/**": true
+  }
+}
