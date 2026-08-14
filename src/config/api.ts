@@ -126,3 +126,17 @@ export async function apiPatch<T>(path: string, body: any, token?: string): Prom
 
   return handleResponse<T>(res);
 }
+
+export async function apiPut<T>(path: string, body: any, token?: string): Promise<T> {
+  ensureApiUrl();
+  const url = `${API_URL}${normalizePath(path)}`;
+  const res = await fetchWithTimeout(url, {
+    method: "PUT",
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  return handleResponse<T>(res);
+}

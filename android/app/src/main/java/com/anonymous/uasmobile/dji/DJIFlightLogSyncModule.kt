@@ -4,6 +4,8 @@ import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.os.Environment
+import android.provider.DocumentsContract
+import android.provider.OpenableColumns
 import android.webkit.MimeTypeMap
 import androidx.documentfile.provider.DocumentFile
 import com.facebook.react.bridge.ActivityEventListener
@@ -22,6 +24,7 @@ class DJIFlightLogSyncModule(
   private val prefs = reactContext.getSharedPreferences("dji_flight_log_sync", 0)
   private var folderPickerPromise: Promise? = null
   private var folderPickerSourceApp: String? = null
+  private var logPickerPromise: Promise? = null
 
   private data class SourceDefinition(
     val sourceApp: String,
@@ -143,6 +146,39 @@ class DJIFlightLogSyncModule(
   }
 
   @ReactMethod
+  fun pickLogs(sourceApp: String, promise: Promise) {
+    val activity = reactContext.currentActivity
+    if (activity == null) {
+      promise.reject("NO_ACTIVITY", "No hay una actividad Android activa para abrir el selector.")
+      return
+    }
+    if (logPickerPromise != null) {
+      promise.reject("PICKER_BUSY", "Ya hay un selector de archivos abierto.")
+      return
+    }
+
+    logPickerPromise = promise
+    try {
+      val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+        addCategory(Intent.CATEGORY_OPENABLE)
+        type = "*/*"
+        putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        addFlags(
+          Intent.FLAG_GRANT_READ_URI_PERMISSION or
+            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+        )
+        initialUriFor(sourceApp)?.let {
+          putExtra(DocumentsContract.EXTRA_INITIAL_URI, it)
+        }
+      }
+      activity.startActivityForResult(intent, LOG_PICKER_REQUEST_CODE)
+    } catch (error: Throwable) {
+      logPickerPromise = null
+      promise.reject("PICKER_FAILED", error.message ?: error.toString())
+    }
+  }
+
+  @ReactMethod
   fun clearFolderAccess(sourceApp: String, promise: Promise) {
     val uriString = prefs.getString(prefKey(sourceApp), null)
     if (!uriString.isNullOrBlank()) {
@@ -215,6 +251,10 @@ class DJIFlightLogSyncModule(
   }
 
   override fun onActivityResult(activity: Activity, requestCode: Int, resultCode: Int, data: Intent?) {
+    if (requestCode == LOG_PICKER_REQUEST_CODE) {
+      resolveLogPicker(resultCode, data)
+      return
+    }
     if (requestCode != FOLDER_PICKER_REQUEST_CODE) return
 
     val promise = folderPickerPromise
@@ -265,6 +305,84 @@ class DJIFlightLogSyncModule(
   }
 
   override fun onNewIntent(intent: Intent) = Unit
+
+  private fun resolveLogPicker(resultCode: Int, data: Intent?) {
+    val promise = logPickerPromise
+    logPickerPromise = null
+    if (promise == null) return
+
+    if (resultCode != Activity.RESULT_OK) {
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("canceled", true)
+        putArray("assets", Arguments.createArray())
+      })
+      return
+    }
+
+    try {
+      val uris = linkedSetOf<Uri>()
+      data?.clipData?.let { clip ->
+        for (index in 0 until clip.itemCount) uris.add(clip.getItemAt(index).uri)
+      }
+      data?.data?.let { uris.add(it) }
+
+      val assets = Arguments.createArray()
+      uris.forEach { uri ->
+        try {
+          reactContext.contentResolver.takePersistableUriPermission(
+            uri,
+            Intent.FLAG_GRANT_READ_URI_PERMISSION
+          )
+        } catch (_: Throwable) {
+        }
+        assets.pushMap(assetForUri(uri))
+      }
+      promise.resolve(Arguments.createMap().apply {
+        putBoolean("canceled", false)
+        putArray("assets", assets)
+      })
+    } catch (error: Throwable) {
+      promise.reject("PICKER_RESULT_FAILED", error.message ?: error.toString())
+    }
+  }
+
+  private fun initialUriFor(sourceApp: String): Uri? {
+    val relativePath = when (sourceApp) {
+      "DJI_PILOT_2" ->
+        "DJI/com.dji.industry.pilot/FlightRecord"
+      "DJI_GO_4" -> "DJI/dji.go.v4/FlightRecord"
+      else -> "DJI/dji.go.v5/FlightRecord"
+    }
+    return DocumentsContract.buildDocumentUri(
+      "com.android.externalstorage.documents",
+      "primary:$relativePath"
+    )
+  }
+
+  private fun assetForUri(uri: Uri): com.facebook.react.bridge.WritableMap {
+    var name = uri.lastPathSegment ?: "flight-log"
+    var size = 0L
+    reactContext.contentResolver.query(
+      uri,
+      arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE),
+      null,
+      null,
+      null
+    )?.use { cursor ->
+      if (cursor.moveToFirst()) {
+        val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+        val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+        if (nameIndex >= 0) name = cursor.getString(nameIndex) ?: name
+        if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) size = cursor.getLong(sizeIndex)
+      }
+    }
+    return Arguments.createMap().apply {
+      putString("uri", uri.toString())
+      putString("name", name)
+      putString("mimeType", reactContext.contentResolver.getType(uri) ?: mimeTypeForName(name))
+      putDouble("size", size.toDouble())
+    }
+  }
 
   private fun scanDirectDirectory(
     source: SourceDefinition,
@@ -367,6 +485,7 @@ class DJIFlightLogSyncModule(
 
   companion object {
     private const val FOLDER_PICKER_REQUEST_CODE = 30291
+    private const val LOG_PICKER_REQUEST_CODE = 30292
     private val ALLOWED_EXTENSIONS = setOf("txt", "dat", "bin", "csv", "srt", "zip", "json")
   }
 }

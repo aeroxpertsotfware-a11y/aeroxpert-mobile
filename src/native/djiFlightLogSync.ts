@@ -46,6 +46,15 @@ type NativeDJIFlightLogSyncModule = {
     sourceApp: DJIFlightLogSourceApp;
     uri?: string;
   }>;
+  pickLogs: (sourceApp: DJIFlightLogSourceApp) => Promise<{
+    canceled: boolean;
+    assets: Array<{
+      uri: string;
+      name: string;
+      mimeType?: string;
+      size?: number;
+    }>;
+  }>;
   clearFolderAccess: (sourceApp: DJIFlightLogSourceApp) => Promise<boolean>;
 };
 
@@ -58,7 +67,10 @@ export const DJIFlightLogSync = {
     nativeModule?.scanFlightLogs?.() ?? Promise.resolve({ files: [], locations: [] }),
   pickFolder: (sourceApp: DJIFlightLogSourceApp) =>
     nativeModule?.pickFolder?.(sourceApp) ??
-    Promise.resolve({ granted: false, sourceApp }),
+      Promise.resolve({ granted: false, sourceApp }),
+  pickLogs: (sourceApp: DJIFlightLogSourceApp) =>
+    nativeModule?.pickLogs?.(sourceApp) ??
+    Promise.resolve({ canceled: true, assets: [] }),
   clearFolderAccess: (sourceApp: DJIFlightLogSourceApp) =>
     nativeModule?.clearFolderAccess?.(sourceApp) ?? Promise.resolve(false),
 };

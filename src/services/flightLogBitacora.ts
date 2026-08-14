@@ -24,6 +24,10 @@ export type FlightLogBitacoraPrefill = {
   horaFin: string;
   duracionMin: number | null;
   tiempoTotalVueloMin: number | null;
+  distanciaTotalM: number | null;
+  velocidadPromedioMps: number | null;
+  velocidadMaximaMps: number | null;
+  fotografiasCapturadas: number;
   numeroDespegues: number | null;
   numeroAterrizajes: number | null;
   altitudMaxAlcanzada: number | null;
@@ -34,6 +38,21 @@ export type FlightLogBitacoraPrefill = {
   lugarOperacion: string;
   uas: string;
   bateriasUtilizadas: string;
+  bateriasDetalle: Array<{
+    serial: string;
+    duracionMin: number;
+    logs: number;
+    cicloReportado: number | null;
+  }>;
+  rutaConsolidada: Array<{
+    lat: number;
+    lon: number;
+    alt: number | null;
+    t: number | null;
+    logId: string | null;
+  }>;
+  logsValidos: number;
+  logsRechazados: number;
   notas: string;
 };
 

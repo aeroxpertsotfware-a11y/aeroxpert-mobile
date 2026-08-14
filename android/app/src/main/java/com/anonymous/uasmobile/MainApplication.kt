@@ -14,6 +14,7 @@ import com.facebook.react.common.ReleaseLevel
 import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint
 import com.facebook.react.defaults.DefaultReactNativeHost
 import com.anonymous.uasmobile.dji.DJITelemetryPackage
+import com.anonymous.uasmobile.stream.ScreenBroadcastPackage
 
 import expo.modules.ApplicationLifecycleDispatcher
 import expo.modules.ReactNativeHostWrapper
@@ -28,6 +29,7 @@ class MainApplication : Application(), ReactApplication {
               // Packages that cannot be autolinked yet can be added manually here, for example:
               // add(MyReactNativePackage())
               add(DJITelemetryPackage())
+              add(ScreenBroadcastPackage())
             }
 
           override fun getJSMainModuleName(): String = ".expo/.virtual-metro-entry"

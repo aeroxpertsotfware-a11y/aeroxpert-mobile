@@ -4,11 +4,15 @@ import { View, Text, Pressable, StyleSheet, Alert, ActivityIndicator } from "rea
 import { CameraView, useCameraPermissions, BarcodeScanningResult } from "expo-camera";
 import { Ionicons } from "@expo/vector-icons";
 import * as SecureStore from "expo-secure-store";
-import { apiGet } from "../config/api";
+import { apiGet, apiPost } from "../config/api";
 import { StatusBar } from "expo-status-bar";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import NetInfo from "@react-native-community/netinfo";
+import { enqueueOfflineAction } from "../offline/fieldSync";
 
 const SECURE_TOKEN_KEY = "uas_token_v1";
+const QR_CACHE_KEY = "uas_qr_equipment_cache_v1";
 
 async function getToken() {
   return (await SecureStore.getItemAsync(SECURE_TOKEN_KEY)) || "";
@@ -24,7 +28,7 @@ function looksLikeToken(t: string) {
   return /^[a-f0-9]{32}$/i.test(t);
 }
 
-type Props = { navigation: any };
+type Props = { navigation: any; route?: { params?: { missionId?: string; operationContext?: boolean } } };
 
 const FONT = {
   regular: "Nunito_400Regular",
@@ -33,7 +37,7 @@ const FONT = {
   extrabold: "Nunito_800ExtraBold",
 } as const;
 
-export default function QrScanScreen({ navigation }: Props) {
+export default function QrScanScreen({ navigation, route }: Props) {
   const insets = useSafeAreaInsets();
 
   const [permission, requestPermission] = useCameraPermissions();
@@ -71,7 +75,40 @@ export default function QrScanScreen({ navigation }: Props) {
         const auth = await getToken();
 
         // ✅ usa el endpoint directo
-        const bateria = await apiGet<any>(`/baterias/by-token/${tokenQR}`, auth);
+        let bateria: any;
+        const net = await NetInfo.fetch();
+        const online = !!net.isConnected && !!net.isInternetReachable;
+        try {
+          if (!online) throw new Error("offline");
+          bateria = await apiGet<any>(`/baterias/by-token/${tokenQR}`, auth);
+          const rawCache = await AsyncStorage.getItem(QR_CACHE_KEY);
+          const cache = rawCache ? JSON.parse(rawCache) : {};
+          cache[tokenQR] = { data: bateria, cachedAt: new Date().toISOString() };
+          await AsyncStorage.setItem(QR_CACHE_KEY, JSON.stringify(cache));
+        } catch (networkError) {
+          const rawCache = await AsyncStorage.getItem(QR_CACHE_KEY);
+          const cache = rawCache ? JSON.parse(rawCache) : {};
+          bateria = cache?.[tokenQR]?.data;
+          if (!bateria) throw networkError;
+          bateria = { ...bateria, offlineCache: true };
+        }
+
+        const missionId = String(route?.params?.missionId || "").trim();
+        if (missionId && route?.params?.operationContext) {
+          const endpoint = `/api/misiones/${missionId}/flujo-operacion/leer-qr`;
+          const body = { qrToken: tokenQR, bateriaId: bateria?._id || null, contexto: "OPERACION" };
+          if (online) {
+            await apiPost(endpoint, body, auth);
+          } else {
+            await enqueueOfflineAction({
+              category: "operation",
+              missionId,
+              endpoint,
+              method: "POST",
+              body,
+            });
+          }
+        }
 
         navLock.current = true;
 
@@ -86,7 +123,7 @@ export default function QrScanScreen({ navigation }: Props) {
         setLoading(false);
       }
     },
-    [scanned, loading, navigation]
+    [scanned, loading, navigation, route?.params?.missionId, route?.params?.operationContext]
   );
 
   // ✅ Pantalla de permiso profesional

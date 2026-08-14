@@ -56,12 +56,18 @@ export async function uploadFlightLogsOnline(
 
     try {
       const response: any = await apiUploadForm("/api/flight-logs/upload", form, { timeoutMs: 30000 });
+      const alreadyInBitacora = Boolean(response?.duplicate && response?.data?.vueloId);
       results.push({
         id: file.id,
         name: file.name,
-        ok: true,
-        message: "Subido correctamente.",
-        serverFlightLogId: response?.data?._id ? String(response.data._id) : undefined,
+        ok: !alreadyInBitacora,
+        message: alreadyInBitacora
+          ? "Este log ya pertenece a otra bitácora."
+          : response?.duplicate
+            ? "Log duplicado reutilizado sin volver a cargarlo."
+            : "Subido correctamente.",
+        serverFlightLogId:
+          !alreadyInBitacora && response?.data?._id ? String(response.data._id) : undefined,
         summary: response?.data?.summary || null,
         telemetry: response?.data?.telemetry || null,
       });

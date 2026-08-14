@@ -1,5 +1,6 @@
 import React, { useEffect, useState, useCallback } from "react";
-import { View, ActivityIndicator, Text, Alert } from "react-native";
+import { View, ActivityIndicator, Text, Alert, Linking } from "react-native";
+import * as Notifications from "expo-notifications";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { NavigationContainer } from "@react-navigation/native";
@@ -18,6 +19,7 @@ import LoginScreen from "./src/screens/LoginScreen";
 import PilotsScreen from "./src/screens/PilotsScreen";
 import QrScanScreen from "./src/screens/QrScanScreen";
 import BateriaDetalleScreen from "./src/screens/BateriaDetalleScreen";
+import ScreenBroadcastScreen from "./src/screens/ScreenBroadcastScreen";
 import { registerPushToken } from "./src/services/push";
 
 const TOKEN_KEY = "@auth_token";
@@ -27,6 +29,7 @@ type RootStackParamList = {
   Pilots: undefined;
   QrScan: undefined;
   BateriaDetalle: { bateria: any };
+  ScreenBroadcast: undefined;
 };
 
 const Stack = createNativeStackNavigator<RootStackParamList>();
@@ -59,6 +62,16 @@ function AppInner() {
     return () => {
       mounted = false;
     };
+  }, []);
+
+  useEffect(() => {
+    const openBroadcastLink = (response: Notifications.NotificationResponse | null) => {
+      const url = String(response?.notification?.request?.content?.data?.viewerUrl || "").trim();
+      if (/^https:\/\//i.test(url)) Linking.openURL(url).catch(() => {});
+    };
+    const subscription = Notifications.addNotificationResponseReceivedListener(openBroadcastLink);
+    Notifications.getLastNotificationResponseAsync().then(openBroadcastLink).catch(() => {});
+    return () => subscription.remove();
   }, []);
 
   const handleLoginSuccess = useCallback(async (newToken: string) => {
@@ -116,6 +129,9 @@ function AppInner() {
               </Stack.Screen>
               <Stack.Screen name="QrScan" component={QrScanScreen} />
               <Stack.Screen name="BateriaDetalle" component={BateriaDetalleScreen} />
+              <Stack.Screen name="ScreenBroadcast">
+                {(props) => <ScreenBroadcastScreen {...props} token={token} />}
+              </Stack.Screen>
             </>
           )}
         </Stack.Navigator>

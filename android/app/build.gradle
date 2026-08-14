@@ -160,6 +160,7 @@ dependencies {
     implementation("com.facebook.react:react-android")
     implementation("com.dji:dji-sdk:4.16.4")
     compileOnly("com.dji:dji-sdk-provided:4.16.4")
+    implementation("com.github.pedroSG94.RootEncoder:library:2.6.0")
 
     def isGifEnabled = (findProperty('expo.gif.enabled') ?: "") == "true";
     def isWebpEnabled = (findProperty('expo.webp.enabled') ?: "") == "true";

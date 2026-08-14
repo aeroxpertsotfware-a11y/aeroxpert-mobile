@@ -22,6 +22,7 @@ import {
   Linking,
   AppState,
   TouchableWithoutFeedback,
+  Alert,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
@@ -31,7 +32,7 @@ import { MaterialCommunityIcons, Ionicons } from "@expo/vector-icons";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { LinearGradient } from "expo-linear-gradient";
 import * as SecureStore from "expo-secure-store";
-import DateTimePicker, { DateTimePickerEvent } from "@react-native-community/datetimepicker";
+import DateTimePicker, { DateTimePickerAndroid, DateTimePickerEvent } from "@react-native-community/datetimepicker";
 import * as Speech from "expo-speech";
 import type { NativeStackNavigationProp } from "@react-navigation/native-stack";
 import { WebView } from "react-native-webview";
@@ -44,6 +45,12 @@ import { apiPost as apiPostReq } from "../config/api";
 import Toast from "react-native-toast-message";
 import { useAuth } from "../context/AuthContext";
 import NetInfo from "@react-native-community/netinfo";
+import {
+  enqueueOfflineAction,
+  getOfflineActions,
+  persistOfflineFiles,
+  syncOfflineActions,
+} from "../offline/fieldSync";
 import * as ImagePicker from "expo-image-picker";
 import * as DocumentPicker from "expo-document-picker";
 
@@ -56,7 +63,7 @@ import * as DocumentPicker from "expo-document-picker";
 
 import { API_URL } from "../config/api";
 import { apiUploadForm } from "../services/api";
-import { useNavigation } from "@react-navigation/native";
+import { useFocusEffect, useNavigation } from "@react-navigation/native";
 import { socket } from "../services/socket";
 import { DJITelemetry } from "../native/djiTelemetry";
 import {
@@ -79,6 +86,8 @@ import {
   uploadFlightLogsOnline as uploadFlightLogsOnlineService,
 } from "../services/flightLogUpload";
 import { getFlightLogBitacoraPrefill } from "../services/flightLogBitacora";
+import MissionPlannerScreen from "./MissionPlannerScreen";
+import ChiefManagementScreen from "./ChiefManagementScreen";
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
@@ -163,7 +172,8 @@ type Section =
   | "mor-reports"
   | "flight-log"
   | "missions"
-  | "procedures";
+  | "procedures"
+  | "chief-management";
 
 type AlertTipo = "warning" | "info" | "error" | "success";
 
@@ -180,7 +190,26 @@ type Usuario = {
   fechaSeguro?: string;
   adiciones?: string[];
   rol?: string;
+  roles?: string[];
   email?: string;
+  empresaId?: string;
+  rolActivo?: string;
+  fechaCertificadoInicio?: string;
+  documentosCampo?: {
+    certificadoMedico?: CampoDocument | null;
+    cipu?: CampoDocument | null;
+    arl?: CampoDocument | null;
+  };
+};
+
+type CampoDocument = {
+  key?: string;
+  name?: string;
+  mime?: string;
+  size?: number;
+  uploadedAt?: string;
+  fechaInicio?: string | null;
+  fechaVencimiento?: string | null;
 };
 
 type PanicAlertApiResponse = {
@@ -495,6 +524,21 @@ type Mision = {
   estado: string;
   areaOperacion?: any | null; // acá viene el polígono/geojson
   pilotosAsignados?: any[];   // si lo populaste
+  creadoPor?: any;
+  observadorId?: any;
+  esRepetitiva?: boolean;
+  serieRepetitivaId?: string | null;
+  fechaInicioRepeticion?: string | null;
+  fechaFinRepeticion?: string | null;
+  estadoAutorizacionVuelo?: "disponible" | "pendiente_gestion" | "no_requiere" | string;
+  responsableAutorizacionVuelo?: "piloto" | "jefepilotos" | string;
+  estadoAprobacion?: "no_requerida" | "pendiente" | "aprobada" | "devuelta" | string;
+  motivoDevolucion?: string;
+  relacionUsuario?: {
+    creadaPorMi?: boolean;
+    asignadaAMi?: boolean;
+    soyObservador?: boolean;
+  };
 };
 type Vuelo = {
   _id: string;
@@ -527,6 +571,23 @@ type Vuelo = {
   numeroAterrizajes?: number | null;
   tiempoTotalVueloMin?: number | null;
   bateriasUtilizadas?: string;
+  bateriasDetalle?: Array<{
+    serial: string;
+    duracionMin: number;
+    logs: number;
+    cicloReportado?: number | null;
+  }>;
+  distanciaTotalM?: number;
+  velocidadPromedioMps?: number;
+  velocidadMaximaMps?: number;
+  fotografiasCapturadas?: number;
+  rutaConsolidada?: Array<{
+    lat: number;
+    lon: number;
+    alt?: number | null;
+    t?: number | null;
+    logId?: string | null;
+  }>;
   payload?: string;
   checklistPrevueloRealizado?: boolean | null;
   evaluacionRiesgos?: string;
@@ -549,6 +610,17 @@ type EquipoUAS = {
   horasVuelo?: number;
   estado?: string;
   fotoUrl?: string | null;
+  polizaVigencia?: string | null;
+  polizaVence?: string | null;
+  manualUsuarioLink?: string | null;
+  polizaPdf?: { key?: string; name?: string } | null;
+  ruasPdf?: { key?: string; name?: string } | null;
+  arrendado?: boolean;
+  fechaInicioArrendamiento?: string | null;
+  fechaFinArrendamiento?: string | null;
+  mantIntervaloHoras?: number;
+  mantUmbralAviso?: number;
+  mantUltimaHora?: number;
   createdAt?: string;
 };
 
@@ -614,6 +686,23 @@ type NuevoVueloPayload = {
   numeroAterrizajes?: number;
   tiempoTotalVueloMin?: number;
   bateriasUtilizadas?: string;
+  bateriasDetalle?: Array<{
+    serial: string;
+    duracionMin: number;
+    logs: number;
+    cicloReportado?: number | null;
+  }>;
+  distanciaTotalM?: number;
+  velocidadPromedioMps?: number;
+  velocidadMaximaMps?: number;
+  fotografiasCapturadas?: number;
+  rutaConsolidada?: Array<{
+    lat: number;
+    lon: number;
+    alt?: number | null;
+    t?: number | null;
+    logId?: string | null;
+  }>;
   payload?: string;
   checklistPrevueloRealizado?: boolean;
   evaluacionRiesgos?: string;
@@ -706,6 +795,7 @@ function isMissionVisiblePendingStatus(value: unknown): boolean {
 }
 const PILOT_CARD_HEADER_LOGO = require("../../assets/avatar.png");
 const PILOT_PANEL_BANNER_LOGO = require("../../assets/logo-inicio.png");
+const FLYNORTH_BANNER_LOGO = require("../../assets/flynorth-empresa.png");
 const ALFABOT_BOT_IMG = require("../../assets/AlfaBot.jpg");
 
 
@@ -721,6 +811,30 @@ type PendingProc = {
 
 function makeLocalId(prefix: string) {
   return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function relationEntityId(value: any) {
+  return String(value?._id || value?.id || value || "").trim();
+}
+
+function getMissionRelationLabels(mission: Mision, userId?: string) {
+  const uid = String(userId || "").trim();
+  const labels: Array<{ key: string; text: string; tone: "created" | "assigned" | "observer" }> = [];
+  const createdByMe = mission.relacionUsuario?.creadaPorMi === true || (!!uid && relationEntityId(mission.creadoPor) === uid);
+  const assignedToMe =
+    mission.relacionUsuario?.asignadaAMi === true ||
+    (!!uid && (mission.pilotosAsignados || []).some((pilot) => relationEntityId(pilot) === uid));
+  const observerForMe = mission.relacionUsuario?.soyObservador === true || (!!uid && relationEntityId(mission.observadorId) === uid);
+  if (createdByMe) {
+    labels.push({ key: "created", text: "Creada por mí", tone: "created" });
+  }
+  if (assignedToMe) {
+    labels.push({ key: "assigned", text: "Asignada a mí", tone: "assigned" });
+  }
+  if (observerForMe) {
+    labels.push({ key: "observer", text: "Soy observador", tone: "observer" });
+  }
+  return labels;
 }
 
 
@@ -1133,6 +1247,24 @@ async function getToken() {
   return (await SecureStore.getItemAsync(SECURE_TOKEN_KEY)) || "";
 }
 
+function decodeJwtAccess(tokenValue: string): { empresaId?: string; rolActivo?: string; rol?: string } {
+  try {
+    const payload = String(tokenValue || "").split(".")[1] || "";
+    if (!payload) return {};
+    const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    const decoded = globalThis.atob(padded);
+    const claims = JSON.parse(decoded);
+    return {
+      empresaId: String(claims?.empresaId || ""),
+      rolActivo: String(claims?.rolActivo || claims?.rol || ""),
+      rol: String(claims?.rol || ""),
+    };
+  } catch {
+    return {};
+  }
+}
+
 export async function apiPost<T>(
   path: string,
   body: any,
@@ -1282,12 +1414,18 @@ async function apiFetch<T>(
 
 
 async function getLocalProcStatusForMission(misionId: string) {
-  const q = await getQueue<PendingProc>(SECURE_PROC_QUEUE_KEY);
+  const [q, fieldQueue] = await Promise.all([
+    getQueue<PendingProc>(SECURE_PROC_QUEUE_KEY),
+    getOfflineActions(),
+  ]);
+  const pendingKinds = fieldQueue
+    .filter((item) => item.category === "procedure" && item.missionId === misionId)
+    .map((item) => String(item.body?.offlineProcedureKind || ""));
 
   const local = {
-    preflight: q.some(p => p.misionId === misionId && p.kind === "preflight"),
-    autoeval:  q.some(p => p.misionId === misionId && p.kind === "autoeval"),
-    battery:   q.some(p => p.misionId === misionId && p.kind === "battery"),
+    preflight: q.some(p => p.misionId === misionId && p.kind === "preflight") || pendingKinds.includes("preflight"),
+    autoeval:  q.some(p => p.misionId === misionId && p.kind === "autoeval") || pendingKinds.includes("autoeval"),
+    battery:   q.some(p => p.misionId === misionId && p.kind === "battery") || pendingKinds.includes("battery"),
   };
 
   return local;
@@ -1330,6 +1468,22 @@ function formatDateOnly(value?: string | Date | null) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return String(value).slice(0, 10) || "—";
   return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+}
+
+function formatWeatherObservation(value?: string | null) {
+  if (!value) return "sin hora";
+  const raw = String(value);
+  const localIso = raw.match(/^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2})/);
+  if (localIso) return `${localIso[1]} ${localIso[2]}`;
+  const date = new Date(raw);
+  return Number.isNaN(date.getTime()) ? raw : formatDateTime(date);
+}
+
+function dateFromYmd(value?: string | null) {
+  const match = String(value || "").match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return new Date();
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  return Number.isNaN(date.getTime()) ? new Date() : date;
 }
 
 function formatHourOnly(value?: string | Date | null) {
@@ -1410,6 +1564,38 @@ function weatherCodeToEs(code?: number | null) {
   if ([71, 73, 75, 77, 85, 86].includes(code)) return "Nieve";
   if ([95, 96, 99].includes(code)) return "Tormenta";
   return "Variable";
+}
+
+function deriveCurrentSkyLabel(input: {
+  weatherCode?: number | null;
+  cloudCoverPct?: number | null;
+  radiationWm2?: number | null;
+  rainMm?: number | null;
+  isDay?: boolean;
+}) {
+  const code = Number(input.weatherCode ?? NaN);
+  const cloud = Number(input.cloudCoverPct ?? NaN);
+  const radiation = Number(input.radiationWm2 ?? NaN);
+  const rain = Number(input.rainMm ?? NaN);
+  const coded = weatherCodeToEs(input.weatherCode);
+
+  if ([45, 48, 51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 71, 73, 75, 77, 80, 81, 82, 85, 86, 95, 96, 99].includes(code)) {
+    return coded;
+  }
+  if (Number.isFinite(rain) && rain > 0.05) return "Lluvia";
+
+  // La radiación actual ayuda a no presentar “nublado” cuando en campo
+  // existe sol directo, aunque el modelo horario tenga mucha cobertura total.
+  if (input.isDay && Number.isFinite(radiation)) {
+    if (radiation >= 450 && (!Number.isFinite(cloud) || cloud <= 80)) return "Despejado";
+    if (radiation >= 250) return "Parcialmente nublado";
+  }
+  if (Number.isFinite(cloud)) {
+    if (cloud <= 20) return "Despejado";
+    if (cloud <= 65) return "Parcialmente nublado";
+    return "Nublado";
+  }
+  return coded;
 }
 
 function windDirectionToCardinal(deg?: number | null) {
@@ -1699,10 +1885,45 @@ export default function PilotPanel({
   const insets = useSafeAreaInsets();
 
   const [section, setSection] = useState<Section>("dashboard");
+  const [equiposViewMode, setEquiposViewMode] = useState<"fleet" | "hours">("fleet");
+  const [maintenanceConfigMap, setMaintenanceConfigMap] = useState<Record<string, {
+    intervaloHoras: string;
+    umbralAviso: string;
+    ultimaMantHoras: string;
+  }>>({});
+  const [savingMaintenanceId, setSavingMaintenanceId] = useState("");
   const [showNavScrollHint, setShowNavScrollHint] = useState<boolean>(true);
 
   const [usuario, setUsuario] = useState<Usuario | null>(initialUser);
+  const [medicalCertificateStart, setMedicalCertificateStart] = useState("");
+  const [medicalCertificateEnd, setMedicalCertificateEnd] = useState("");
+  const [showMedicalStartDate, setShowMedicalStartDate] = useState(false);
+  const [showMedicalEndDate, setShowMedicalEndDate] = useState(false);
+  const [fieldDocumentBusy, setFieldDocumentBusy] = useState("");
+  const [showMissionPlanner, setShowMissionPlanner] = useState(false);
+  const [missionPlannerToken, setMissionPlannerToken] = useState("");
+  const isFlyNorthCompany =
+    String(usuario?.empresaId || "") === "69e04f2d17205ef6e90e5e95";
+  const canPlanFlyNorthMission =
+    isFlyNorthCompany &&
+    ["piloto", "jefepilotos", "admin"].includes(
+      String(usuario?.rolActivo || usuario?.rol || "").toLowerCase().trim()
+    );
+  const canApproveFlyNorthMission =
+    isFlyNorthCompany &&
+    [usuario?.rolActivo, usuario?.rol, ...(usuario?.roles || [])].some((role) => {
+      const normalized = String(role || "").toLowerCase().trim();
+      return ["jefepilotos", "jefe", "admin"].includes(normalized) || normalized.includes("jefe");
+    });
+  const normalizedActiveRole = String(usuario?.rolActivo || usuario?.rol || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[\s_-]+/g, "")
+    .trim();
+  const isChiefPilotRole = ["jefepilotos", "jefe", "admin", "administrador"].includes(normalizedActiveRole);
   const [alertas, setAlertas] = useState<Alerta[]>([]);
+  const [showPilotNotifications, setShowPilotNotifications] = useState(false);
   const [reportes, setReportes] = useState<Reporte[]>([]);
   const [misiones, setMisiones] = useState<Mision[]>([]);
   const [vuelos, setVuelos] = useState<Vuelo[]>([]);
@@ -1813,6 +2034,9 @@ const [misionMapa, setMisionMapa] = useState<Mision | null>(null);
       }
     >
   >({});
+  const operationLocationSubRef = React.useRef<Location.LocationSubscription | null>(null);
+  const operationTrackRef = React.useRef<Array<{ lat: number; lon: number; accuracy?: number | null; at: string }>>([]);
+  const operationTrackMissionRef = React.useRef("");
 
   type FlujoOperacionApi = {
     _id: string;
@@ -1975,6 +2199,41 @@ const [showTipoReporteModal, setShowTipoReporteModal] = useState(false);
   const [equipos, setEquipos] = useState<EquipoUAS[]>([]);
   const [loadingEquipos, setLoadingEquipos] = useState(false);
   const [equiposError, setEquiposError] = useState("");
+  const [showEquipoForm, setShowEquipoForm] = useState(false);
+  const [savingEquipo, setSavingEquipo] = useState(false);
+  const [expandedEquipoIds, setExpandedEquipoIds] = useState<Record<string, boolean>>({});
+  const [showBatteryForm, setShowBatteryForm] = useState(false);
+  const [savingBattery, setSavingBattery] = useState(false);
+  const [batteryForm, setBatteryForm] = useState({
+    equipoId: "",
+    nombre: "",
+    marca: "",
+    modelo: "",
+    serial: "",
+    ciclos: "0",
+    maxCiclos: "200",
+    fechaAdquisicion: "",
+    notas: "",
+  });
+  const [editingEquipoId, setEditingEquipoId] = useState("");
+  const [equipoForm, setEquipoForm] = useState({
+    ruas: "",
+    serie: "",
+    modelo: "",
+    horasVuelo: "0",
+    estado: "Aeronavegable",
+    polizaVigencia: "",
+    polizaVence: "",
+    manualUsuarioLink: "",
+    arrendado: false,
+    fechaInicioArrendamiento: "",
+    fechaFinArrendamiento: "",
+  });
+  const [equipoFiles, setEquipoFiles] = useState<{
+    foto?: { uri: string; name: string; mimeType: string };
+    polizaPdf?: { uri: string; name: string; mimeType: string };
+    ruasPdf?: { uri: string; name: string; mimeType: string };
+  }>({});
 
   const [showEquiposModal, setShowEquiposModal] = useState(false);
   const [equipoSel, setEquipoSel] = useState<EquipoUAS | null>(null);
@@ -2419,12 +2678,18 @@ async function uploadFlightLogsOnline(
 
     try {
       const response: any = await apiUploadForm("/api/flight-logs/upload", form, { timeoutMs: 30000 });
+      const alreadyInBitacora = Boolean(response?.duplicate && response?.data?.vueloId);
       results.push({
         id: file.id,
         name: file.name,
-        ok: true,
-        message: "Subido correctamente.",
-        serverFlightLogId: response?.data?._id ? String(response.data._id) : undefined,
+        ok: !alreadyInBitacora,
+        message: alreadyInBitacora
+          ? "Este log ya pertenece a otra bitácora."
+          : response?.duplicate
+            ? "Log duplicado reutilizado sin volver a cargarlo."
+            : "Subido correctamente.",
+        serverFlightLogId:
+          !alreadyInBitacora && response?.data?._id ? String(response.data._id) : undefined,
         summary: response?.data?.summary || null,
         telemetry: response?.data?.telemetry || null,
       });
@@ -2444,18 +2709,6 @@ async function uploadFlightLogsOnline(
 
 
 const pickEvidenceImages = useCallback(async () => {
-  const net = await NetInfo.fetch();
-  const online = !!net.isConnected && !!net.isInternetReachable;
-
-  if (!online) {
-    Toast.show({
-      type: "error",
-      text1: "Sin conexión",
-      text2: "Para subir evidencias debes tener internet.",
-    });
-    return;
-  }
-
   const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
   if (!perm.granted) {
     Toast.show({ type: "error", text1: "Permiso", text2: "Habilita galería para adjuntar evidencias." });
@@ -3207,6 +3460,125 @@ const speakThenListen = useCallback((msg: string) => {
     () => getCertStatus(usuario?.fechaCertificado),
     [usuario?.fechaCertificado]
   );
+  const pilotNotifications = useMemo(() => {
+    const items: Array<{
+      id: string;
+      title: string;
+      detail: string;
+      icon: keyof typeof MaterialCommunityIcons.glyphMap;
+      tone: "danger" | "info" | "warning";
+    }> = [];
+
+    if (certStatus.label === "Vencido") {
+      items.push({
+        id: "medical-expired",
+        title: "Certificado médico vencido",
+        detail: "Actualiza el certificado para volver a estar disponible para operaciones.",
+        icon: "medical-bag",
+        tone: "danger",
+      });
+    } else if (certStatus.label === "—") {
+      items.push({
+        id: "medical-missing",
+        title: "Certificado médico pendiente",
+        detail: "No encontramos una vigencia registrada en tu perfil.",
+        icon: "file-alert-outline",
+        tone: "warning",
+      });
+    }
+
+    misiones
+      .filter((mission) => !["Cumplida", "Cancelada", "Finalizada"].includes(String(mission.estado || "")))
+      .slice(0, 8)
+      .forEach((mission) => {
+        items.push({
+          id: `mission-${mission._id}`,
+          title: mission.titulo || "Misión asignada",
+          detail: `${formatDateOnly(mission.fechaOperacion)} · ${mission.estado || "Programada"}`,
+          icon: "clipboard-text-outline",
+          tone: "info",
+        });
+      });
+
+    alertas.slice(0, 8).forEach((alerta) => {
+      items.push({
+        id: `alert-${alerta._id}`,
+        title: alerta.tipo || "Alerta operacional",
+        detail: alerta.mensaje || formatDateOnly(alerta.fecha),
+        icon: "alert-circle-outline",
+        tone: alerta.nivel === "error" ? "danger" : alerta.nivel === "info" ? "info" : "warning",
+      });
+    });
+
+    return items;
+  }, [alertas, certStatus.label, misiones]);
+  const notificationBellMotion = React.useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    notificationBellMotion.stopAnimation();
+    notificationBellMotion.setValue(0);
+    if (!pilotNotifications.length) return;
+
+    const animation = Animated.loop(
+      Animated.sequence([
+        Animated.delay(1200),
+        Animated.timing(notificationBellMotion, { toValue: 1, duration: 90, easing: Easing.linear, useNativeDriver: true }),
+        Animated.timing(notificationBellMotion, { toValue: -1, duration: 90, easing: Easing.linear, useNativeDriver: true }),
+        Animated.timing(notificationBellMotion, { toValue: 0.75, duration: 90, easing: Easing.linear, useNativeDriver: true }),
+        Animated.timing(notificationBellMotion, { toValue: -0.75, duration: 90, easing: Easing.linear, useNativeDriver: true }),
+        Animated.timing(notificationBellMotion, { toValue: 0, duration: 90, easing: Easing.linear, useNativeDriver: true }),
+        Animated.delay(2200),
+      ])
+    );
+    animation.start();
+    return () => animation.stop();
+  }, [notificationBellMotion, pilotNotifications.length]);
+
+  const notificationBellRotate = notificationBellMotion.interpolate({
+    inputRange: [-1, 1],
+    outputRange: ["-12deg", "12deg"],
+  });
+  useEffect(() => {
+    const medical = usuario?.documentosCampo?.certificadoMedico;
+    setMedicalCertificateStart(String(medical?.fechaInicio || usuario?.fechaCertificadoInicio || "").slice(0, 10));
+    setMedicalCertificateEnd(String(medical?.fechaVencimiento || usuario?.fechaCertificado || "").slice(0, 10));
+  }, [
+    usuario?.documentosCampo?.certificadoMedico?.fechaInicio,
+    usuario?.documentosCampo?.certificadoMedico?.fechaVencimiento,
+    usuario?.fechaCertificado,
+    usuario?.fechaCertificadoInicio,
+  ]);
+
+  const openMedicalDatePicker = useCallback((field: "start" | "end") => {
+    const currentValue = field === "start"
+      ? medicalCertificateStart
+      : medicalCertificateEnd || medicalCertificateStart;
+    if (Platform.OS === "android") {
+      DateTimePickerAndroid.open({
+        value: dateFromYmd(currentValue),
+        mode: "date",
+        minimumDate:
+          field === "end" && medicalCertificateStart
+            ? dateFromYmd(medicalCertificateStart)
+            : undefined,
+        onChange: (event: DateTimePickerEvent, selected?: Date) => {
+          if (event.type === "dismissed" || !selected) return;
+          const value = formatDateOnly(selected);
+          if (field === "start") {
+            setMedicalCertificateStart(value);
+            if (medicalCertificateEnd && medicalCertificateEnd < value) {
+              setMedicalCertificateEnd("");
+            }
+          } else {
+            setMedicalCertificateEnd(value);
+          }
+        },
+      });
+      return;
+    }
+    if (field === "start") setShowMedicalStartDate(true);
+    else setShowMedicalEndDate(true);
+  }, [medicalCertificateEnd, medicalCertificateStart]);
 
   const missionToday = useMemo(
     () => misiones.find((m) => m.estado !== "Cumplida" && sameDay(m.fechaOperacion)) || misiones.find((m) => m.estado !== "Cumplida") || null,
@@ -3237,9 +3609,29 @@ const speakThenListen = useCallback((msg: string) => {
         gpsCell.enabled && gpsCell.lat != null && gpsCell.lon != null
           ? `Posición actual ${gpsCell.lat.toFixed(5)}, ${gpsCell.lon.toFixed(5)}`
           : "Ubicación de referencia",
+      weather: {
+        ok: weatherDetail.ok,
+        label: weatherDetail.label,
+        tempC: weatherDetail.tempC,
+        windMs: weatherDetail.windMs,
+        precipProbPct: weatherDetail.precipProbPct,
+        flightState: weatherDetail.flightState,
+      },
       centerTick: dashboardMapCenterTick,
     });
-  }, [dashboardMapCenter, dashboardMapCenterTick, gpsCell.enabled, gpsCell.lat, gpsCell.lon]);
+  }, [
+    dashboardMapCenter,
+    dashboardMapCenterTick,
+    gpsCell.enabled,
+    gpsCell.lat,
+    gpsCell.lon,
+    weatherDetail.flightState,
+    weatherDetail.label,
+    weatherDetail.ok,
+    weatherDetail.precipProbPct,
+    weatherDetail.tempC,
+    weatherDetail.windMs,
+  ]);
   const dashboardLocationLabel = useMemo(() => {
     const base = String(currentPlaceLabel || "").trim();
     if (base) return base;
@@ -3766,19 +4158,20 @@ const speakThenListen = useCallback((msg: string) => {
   ]);
 
   const loadSyncSummary = useCallback(async () => {
-    const [procQueue, reportesQueue, vuelosQueue, doneQueue] = await Promise.all([
+    const [procQueue, reportesQueue, vuelosQueue, doneQueue, fieldQueue] = await Promise.all([
       getQueue<PendingProc>(SECURE_PROC_QUEUE_KEY),
       getReporteQueue(),
       getVuelosQueue(),
       getQueue<PendingMisionDone>(SECURE_MISION_CUMPLIDA_QUEUE_KEY),
+      getOfflineActions(),
     ]);
 
     setSyncSummary({
-      procedimientos: procQueue.length,
-      reportes: reportesQueue.length,
+      procedimientos: procQueue.length + fieldQueue.filter((item) => item.category === "procedure").length,
+      reportes: reportesQueue.length + fieldQueue.filter((item) => item.category === "novelty").length,
       vuelos: vuelosQueue.length,
       logs: vuelosQueue.reduce((acc, item) => acc + (item.logs?.length || 0), 0),
-      misiones: doneQueue.length,
+      misiones: doneQueue.length + fieldQueue.filter((item) => ["operation", "evidence", "mission", "briefing"].includes(item.category)).length,
     });
   }, []);
 
@@ -3940,6 +4333,14 @@ const speakThenListen = useCallback((msg: string) => {
     setLoadingMisiones(false);
   }
 }, [loadOfflineMisiones]);
+
+const closeMissionPlanner = useCallback(() => {
+  setShowMissionPlanner(false);
+}, []);
+
+const handleMissionPlannerCreated = useCallback(async () => {
+  await loadMisiones();
+}, [loadMisiones]);
 
 
 useEffect(() => {
@@ -4150,25 +4551,98 @@ const markOperationStatus = useCallback(
   []
 );
 
-const addQrRead = useCallback(() => {
-  if (!operationMission?._id) return;
-  apiFetch<{ ok?: boolean; flujo?: FlujoOperacionApi }>(`/api/misiones/${operationMission._id}/flujo-operacion/leer-qr`, {
-    method: "POST",
-    body: JSON.stringify({ contexto: "OPERACION" }),
-  })
-    .then((r) => applyFlowApiToMissionStatus(operationMission._id, r?.flujo))
-    .catch((e) => {
-      console.log("⚠️ leer-qr:", e?.message || e);
-      const current = operationStatusMap[operationMission._id] || { qrReads: 0, started: false, batteryChanges: 0, finalized: false, awaitingTakeoff: false };
-      markOperationStatus(operationMission._id, { qrReads: current.qrReads + 1 });
-    });
-  navigation.navigate("QrScan");
-}, [operationMission?._id, operationStatusMap, markOperationStatus, navigation, applyFlowApiToMissionStatus]);
+const startOperationTracking = useCallback(async (missionId: string) => {
+  try {
+    operationLocationSubRef.current?.remove();
+    const key = `uas_operation_track_${missionId}`;
+    const stored = await AsyncStorage.getItem(key);
+    operationTrackRef.current = stored ? JSON.parse(stored) : [];
+    operationTrackMissionRef.current = missionId;
+    const permission = await Location.requestForegroundPermissionsAsync();
+    if (permission.status !== "granted") return;
+    operationLocationSubRef.current = await Location.watchPositionAsync(
+      {
+        accuracy: Location.Accuracy.High,
+        timeInterval: 10000,
+        distanceInterval: 5,
+      },
+      (position) => {
+        const point = {
+          lat: position.coords.latitude,
+          lon: position.coords.longitude,
+          accuracy: position.coords.accuracy,
+          at: new Date(position.timestamp || Date.now()).toISOString(),
+        };
+        operationTrackRef.current = [...operationTrackRef.current, point].slice(-5000);
+        AsyncStorage.setItem(key, JSON.stringify(operationTrackRef.current)).catch(() => {});
+      }
+    );
+  } catch (error: any) {
+    console.log("No se pudo iniciar ruta offline:", error?.message || error);
+  }
+}, []);
 
-const performStartOperation = useCallback(() => {
+const stopOperationTracking = useCallback(async (missionId: string) => {
+  operationLocationSubRef.current?.remove();
+  operationLocationSubRef.current = null;
+  const key = `uas_operation_track_${missionId}`;
+  try {
+    const stored = await AsyncStorage.getItem(key);
+    const route = stored ? JSON.parse(stored) : operationTrackRef.current;
+    return Array.isArray(route) ? route : [];
+  } catch {
+    return operationTrackRef.current;
+  }
+}, []);
+
+const queueOperationAction = useCallback(async (
+  missionId: string,
+  endpoint: string,
+  method: "POST" | "PATCH",
+  body: Record<string, any> = {}
+) => {
+  await enqueueOfflineAction({
+    category: "operation",
+    missionId,
+    endpoint,
+    method,
+    body,
+  });
+  await loadSyncSummary();
+}, [loadSyncSummary]);
+
+const addQrRead = useCallback(async () => {
   if (!operationMission?._id) return;
+  const missionId = operationMission._id;
+  const net = await NetInfo.fetch();
+  const online = !!net.isConnected && !!net.isInternetReachable;
+  if (!online) {
+    const current = operationStatusMap[missionId] || { qrReads: 0, started: false, batteryChanges: 0, finalized: false, awaitingTakeoff: false };
+    markOperationStatus(missionId, { qrReads: current.qrReads + 1 });
+    navigation.navigate("QrScan", { missionId, operationContext: true });
+    Toast.show({ type: "info", text1: "Lector offline", text2: "El QR se validará con el inventario guardado." });
+    return;
+  }
+  navigation.navigate("QrScan", { missionId, operationContext: true });
+}, [operationMission?._id, operationStatusMap, markOperationStatus, navigation, applyFlowApiToMissionStatus, queueOperationAction]);
+
+const performStartOperation = useCallback(async () => {
+  if (!operationMission?._id) return;
+  const missionId = operationMission._id;
+  await startOperationTracking(missionId);
+  const net = await NetInfo.fetch();
+  const online = !!net.isConnected && !!net.isInternetReachable;
+  if (!online) {
+    await queueOperationAction(missionId, `/api/misiones/${missionId}/flujo-operacion/iniciar`, "PATCH", {
+      frat: fratRecordsMap[missionId] || null,
+    });
+    markOperationStatus(missionId, { started: true, finalized: false, awaitingTakeoff: false });
+    Toast.show({ type: "success", text1: "Operación iniciada offline", text2: "El evento quedó pendiente de sincronización." });
+    return;
+  }
   apiFetch<{ ok?: boolean; flujo?: FlujoOperacionApi }>(`/api/misiones/${operationMission._id}/flujo-operacion/iniciar`, {
     method: "PATCH",
+    body: JSON.stringify({ frat: fratRecordsMap[missionId] || null }),
   })
     .then((r) => {
       applyFlowApiToMissionStatus(operationMission._id, r?.flujo);
@@ -4179,7 +4653,7 @@ const performStartOperation = useCallback(() => {
       markOperationStatus(operationMission._id, { started: true, finalized: false, awaitingTakeoff: false });
       Toast.show({ type: "success", text1: "Operación iniciada", text2: "Puedes continuar con el vuelo." });
     });
-}, [operationMission?._id, markOperationStatus, applyFlowApiToMissionStatus]);
+}, [operationMission?._id, markOperationStatus, applyFlowApiToMissionStatus, queueOperationAction, fratRecordsMap, startOperationTracking]);
 
 const startOperation = useCallback(async () => {
   if (!operationMission?._id) return;
@@ -4235,15 +4709,26 @@ const startOperation = useCallback(async () => {
   openFratForOperation,
 ]);
 
-const registerBatteryChangeLanding = useCallback(() => {
+const registerBatteryChangeLanding = useCallback(async () => {
   if (!operationMission?._id) return;
+  const missionId = operationMission._id;
+  const net = await NetInfo.fetch();
+  const online = !!net.isConnected && !!net.isInternetReachable;
+  if (!online) {
+    await queueOperationAction(missionId, `/api/misiones/${missionId}/flujo-operacion/aterrizar-cambio`, "PATCH");
+    const current = operationStatusMap[missionId] || { qrReads: 0, started: false, batteryChanges: 0, finalized: false, awaitingTakeoff: false };
+    markOperationStatus(missionId, { batteryChanges: current.batteryChanges + 1, awaitingTakeoff: true, started: false });
+    navigation.navigate("QrScan", { missionId, operationContext: true });
+    Toast.show({ type: "info", text1: "Aterrizaje guardado offline", text2: "Escanea la batería de reemplazo." });
+    return;
+  }
   apiFetch<{ ok?: boolean; flujo?: FlujoOperacionApi }>(`/api/misiones/${operationMission._id}/flujo-operacion/aterrizar-cambio`, {
     method: "PATCH",
   })
     .then((r) => {
       applyFlowApiToMissionStatus(operationMission._id, r?.flujo);
       Toast.show({ type: "info", text1: "Cambio de batería", text2: "Aterrizaje registrado. Abriendo lector QR." });
-      navigation.navigate("QrScan");
+      navigation.navigate("QrScan", { missionId, operationContext: true });
     })
     .catch((e) => {
       console.log("⚠️ aterrizar cambio:", e?.message || e);
@@ -4254,12 +4739,21 @@ const registerBatteryChangeLanding = useCallback(() => {
         started: false,
       });
       Toast.show({ type: "info", text1: "Cambio de batería", text2: "Aterrizaje registrado. Abriendo lector QR." });
-      navigation.navigate("QrScan");
+      navigation.navigate("QrScan", { missionId, operationContext: true });
     });
-}, [operationMission?._id, operationStatusMap, markOperationStatus, navigation, applyFlowApiToMissionStatus]);
+}, [operationMission?._id, operationStatusMap, markOperationStatus, navigation, applyFlowApiToMissionStatus, queueOperationAction]);
 
-const resumeOperationAfterBatteryChange = useCallback(() => {
+const resumeOperationAfterBatteryChange = useCallback(async () => {
   if (!operationMission?._id) return;
+  const missionId = operationMission._id;
+  const net = await NetInfo.fetch();
+  const online = !!net.isConnected && !!net.isInternetReachable;
+  if (!online) {
+    await queueOperationAction(missionId, `/api/misiones/${missionId}/flujo-operacion/despegar`, "PATCH");
+    markOperationStatus(missionId, { awaitingTakeoff: false, started: true });
+    Toast.show({ type: "success", text1: "Despegue guardado offline", text2: "Se sincronizará automáticamente." });
+    return;
+  }
   apiFetch<{ ok?: boolean; flujo?: FlujoOperacionApi }>(`/api/misiones/${operationMission._id}/flujo-operacion/despegar`, {
     method: "PATCH",
   })
@@ -4272,12 +4766,29 @@ const resumeOperationAfterBatteryChange = useCallback(() => {
       markOperationStatus(operationMission._id, { awaitingTakeoff: false, started: true });
       Toast.show({ type: "success", text1: "Operación reanudada", text2: "Despegue después de cambio de batería registrado." });
     });
-}, [operationMission?._id, markOperationStatus, applyFlowApiToMissionStatus]);
+}, [operationMission?._id, markOperationStatus, applyFlowApiToMissionStatus, queueOperationAction]);
 
-const finalizeOperation = useCallback(() => {
+const finalizeOperation = useCallback(async () => {
   if (!operationMission?._id) return;
+  const missionId = operationMission._id;
+  const rutaGps = await stopOperationTracking(missionId);
+  const net = await NetInfo.fetch();
+  const online = !!net.isConnected && !!net.isInternetReachable;
+  if (!online) {
+    await queueOperationAction(missionId, `/api/misiones/${missionId}/flujo-operacion/finalizar`, "PATCH", { rutaGps });
+    markOperationStatus(missionId, { started: false, finalized: true, awaitingTakeoff: false });
+    setShowOperationFlowModal(false);
+    setEvidenceMissionId(missionId);
+    setEvidenceNote("");
+    setEvidenceItems([]);
+    setEvidenceChecklist({ area: false, aeronave: false, equipo: false });
+    setShowEvidenceModal(true);
+    Toast.show({ type: "info", text1: "Finalización provisional", text2: "Adjunta evidencias; todo se enviará al recuperar conexión." });
+    return;
+  }
   apiFetch<{ ok?: boolean; flujo?: FlujoOperacionApi }>(`/api/misiones/${operationMission._id}/flujo-operacion/finalizar`, {
     method: "PATCH",
+    body: JSON.stringify({ rutaGps }),
   })
     .then((r) => {
       applyFlowApiToMissionStatus(operationMission._id, r?.flujo);
@@ -4300,7 +4811,7 @@ const finalizeOperation = useCallback(() => {
         text2: e?.message || "No se pudo finalizar la operación",
       });
     });
-}, [operationMission?._id, applyFlowApiToMissionStatus]);
+}, [operationMission?._id, applyFlowApiToMissionStatus, markOperationStatus, queueOperationAction, stopOperationTracking]);
 
 const loadOfflineProfile = useCallback(async () => {
   try {
@@ -4308,9 +4819,15 @@ const loadOfflineProfile = useCallback(async () => {
     if (!raw) return;
 
     const me = JSON.parse(raw);
+    const claims = decodeJwtAccess(await getToken());
 
     // ✅ tu UI usa "usuario"
-    setUsuario(me);
+    setUsuario({
+      ...me,
+      empresaId: me?.empresaId || claims.empresaId,
+      rolActivo: me?.rolActivo || claims.rolActivo,
+      rol: me?.rol || claims.rol,
+    });
   
   } catch (e) {
     console.log("Error cargando perfil offline:", e);
@@ -4325,9 +4842,16 @@ const loadOfflineProfile = useCallback(async () => {
       // 1) Perfil primero: no debe depender de alertas/misiones
       try {
         const me = await apiFetch<Usuario>("/api/me");
-        setUsuario(me);
+        const claims = decodeJwtAccess(await getToken());
+        const profileWithAccess = {
+          ...me,
+          empresaId: me?.empresaId || claims.empresaId,
+          rolActivo: me?.rolActivo || claims.rolActivo,
+          rol: me?.rol || claims.rol,
+        };
+        setUsuario(profileWithAccess);
         profileLoaded = true;
-        await SecureStore.setItemAsync(SECURE_PROFILE_KEY, JSON.stringify(me), {
+        await SecureStore.setItemAsync(SECURE_PROFILE_KEY, JSON.stringify(profileWithAccess), {
           keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
         });
       } catch (e) {
@@ -4791,17 +5315,31 @@ useEffect(() => {
     if (online) {
       syncReportesQueue?.(); // si existe en tu scope
       syncVuelosQueue();
+      syncOfflineActions()
+        .then((result) => {
+          if (result.sent > 0) {
+            Toast.show({
+              type: "success",
+              text1: "Trabajo de campo sincronizado",
+              text2: `${result.sent} acción(es) enviada(s).`,
+            });
+            loadMisiones();
+            loadDashboard();
+          }
+          loadSyncSummary();
+        })
+        .catch(() => {});
     }
   });
   return () => unsub();
-}, [syncVuelosQueue /*, syncReportesQueue */]);
+}, [syncVuelosQueue, loadDashboard, loadMisiones, loadSyncSummary /*, syncReportesQueue */]);
 
 
 const loadOfflineEquipos = useCallback(async () => {
   try {
     const raw = await SecureStore.getItemAsync(SECURE_EQUIPOS_KEY);
     const arr = raw ? JSON.parse(raw) : [];
-    const visibles = filtrarEquiposVisiblesParaPiloto(arr);
+    const visibles = isChiefPilotRole ? arr : filtrarEquiposVisiblesParaPiloto(arr);
     setEquipos(visibles);
     setEquipoSel((prev) => (prev && visibles.some((e) => e._id === prev._id) ? prev : null));
   } catch (e) {
@@ -4809,7 +5347,7 @@ const loadOfflineEquipos = useCallback(async () => {
     setEquipos([]);
     setEquipoSel(null);
   }
-}, []);
+}, [isChiefPilotRole]);
 
 
 
@@ -4820,9 +5358,22 @@ const loadEquipos = useCallback(async () => {
 
     const data = await apiFetch<any>("/api/equipos");
     const arrRaw = Array.isArray(data) ? data : (data?.data ?? []);
-    const arr = filtrarEquiposVisiblesParaPiloto(arrRaw);
+    const arr = isChiefPilotRole ? arrRaw : filtrarEquiposVisiblesParaPiloto(arrRaw);
 
     setEquipos(arr);
+    setMaintenanceConfigMap((current) => {
+      const next = { ...current };
+      arr.forEach((equipo: EquipoUAS) => {
+        if (!next[equipo._id]) {
+          next[equipo._id] = {
+            intervaloHoras: String(equipo.mantIntervaloHoras ?? 250),
+            umbralAviso: String(equipo.mantUmbralAviso ?? 25),
+            ultimaMantHoras: String(equipo.mantUltimaHora ?? 0),
+          };
+        }
+      });
+      return next;
+    });
     setEquipoSel((prev) => (prev && arr.some((e) => e._id === prev._id) ? prev : null));
 
     // ✅ cache offline
@@ -4841,7 +5392,235 @@ const loadEquipos = useCallback(async () => {
   } finally {
     setLoadingEquipos(false);
   }
-}, [loadOfflineEquipos]);
+}, [isChiefPilotRole, loadOfflineEquipos]);
+
+const getMaintenanceMetrics = useCallback((equipo: EquipoUAS) => {
+  const config = maintenanceConfigMap[equipo._id];
+  const actuales = Number(equipo.horasVuelo || 0);
+  const intervalo = Math.max(1, Number(config?.intervaloHoras ?? equipo.mantIntervaloHoras ?? 250));
+  const umbral = Math.max(0, Number(config?.umbralAviso ?? equipo.mantUmbralAviso ?? 25));
+  const ultima = Math.max(0, Number(config?.ultimaMantHoras ?? equipo.mantUltimaHora ?? 0));
+  const proximo = ultima + intervalo;
+  const restantes = Math.round((proximo - actuales) * 10) / 10;
+  const consumidas = Math.max(0, actuales - ultima);
+  const porcentaje = Math.max(0, Math.min(100, (consumidas / intervalo) * 100));
+  const estado = restantes <= 0 ? "VENCIDO" : restantes <= umbral ? "PRONTO" : "OK";
+  return { actuales, intervalo, umbral, ultima, proximo, restantes, porcentaje, estado };
+}, [maintenanceConfigMap]);
+
+const saveMaintenanceConfig = useCallback(async (equipo: EquipoUAS) => {
+  const metrics = getMaintenanceMetrics(equipo);
+  if (![metrics.intervalo, metrics.umbral, metrics.ultima].every(Number.isFinite)) {
+    Toast.show({ type: "error", text1: "Valores inválidos", text2: "Revisa la configuración de mantenimiento." });
+    return;
+  }
+  try {
+    setSavingMaintenanceId(equipo._id);
+    await apiFetch(`/api/equipos/${equipo._id}/mantenimiento`, {
+      method: "PUT",
+      body: JSON.stringify({
+        mantIntervaloHoras: metrics.intervalo,
+        mantUmbralAviso: metrics.umbral,
+        mantUltimaHora: metrics.ultima,
+      }),
+    });
+    await loadEquipos();
+    Toast.show({ type: "success", text1: "Control de horas actualizado", text2: `${equipo.modelo || "UAS"} recalculado.` });
+  } catch (error: any) {
+    Toast.show({ type: "error", text1: "No se pudo guardar", text2: error?.message || "Intenta nuevamente." });
+  } finally {
+    setSavingMaintenanceId("");
+  }
+}, [getMaintenanceMetrics, loadEquipos]);
+
+const resetEquipoForm = useCallback((equipo?: EquipoUAS | null) => {
+  setEditingEquipoId(String(equipo?._id || ""));
+  setEquipoForm({
+    ruas: String(equipo?.ruas || ""),
+    serie: String(equipo?.serie || ""),
+    modelo: String(equipo?.modelo || ""),
+    horasVuelo: String(equipo?.horasVuelo ?? 0),
+    estado: String(equipo?.estado || "Aeronavegable"),
+    polizaVigencia: String(equipo?.polizaVigencia || "").slice(0, 10),
+    polizaVence: String(equipo?.polizaVence || "").slice(0, 10),
+    manualUsuarioLink: String(equipo?.manualUsuarioLink || ""),
+    arrendado: !!equipo?.arrendado || String(equipo?.estado || "") === "Arrendado",
+    fechaInicioArrendamiento: String(equipo?.fechaInicioArrendamiento || "").slice(0, 10),
+    fechaFinArrendamiento: String(equipo?.fechaFinArrendamiento || "").slice(0, 10),
+  });
+  setEquipoFiles({});
+  setShowEquipoForm(true);
+}, []);
+
+const pickEquipoFile = useCallback(async (field: "foto" | "polizaPdf" | "ruasPdf") => {
+  const picked = await DocumentPicker.getDocumentAsync({
+    type: field === "foto" ? "image/*" : "application/pdf",
+    multiple: false,
+    copyToCacheDirectory: true,
+  });
+  if (picked.canceled || !picked.assets?.[0]) return;
+  const asset = picked.assets[0];
+  const maxBytes = field === "foto" ? 5 * 1024 * 1024 : 15 * 1024 * 1024;
+  if (Number(asset.size || 0) > maxBytes) {
+    Toast.show({
+      type: "error",
+      text1: "Archivo demasiado grande",
+      text2: field === "foto" ? "La foto debe pesar menos de 5 MB." : "El PDF debe pesar menos de 15 MB.",
+    });
+    return;
+  }
+  setEquipoFiles((prev) => ({
+    ...prev,
+    [field]: {
+      uri: asset.uri,
+      name: asset.name || `${field}.${field === "foto" ? "jpg" : "pdf"}`,
+      mimeType: asset.mimeType || (field === "foto" ? "image/jpeg" : "application/pdf"),
+    },
+  }));
+}, []);
+
+const saveEquipo = useCallback(async () => {
+  if (!equipoForm.ruas.trim() || !equipoForm.serie.trim() || !equipoForm.modelo.trim()) {
+    Toast.show({ type: "error", text1: "Faltan datos", text2: "RUAS, serie y modelo son obligatorios." });
+    return;
+  }
+  const horas = Number(equipoForm.horasVuelo || 0);
+  if (!Number.isFinite(horas) || horas < 0) {
+    Toast.show({ type: "error", text1: "Horas inválidas", text2: "Ingresa un valor mayor o igual a cero." });
+    return;
+  }
+  try {
+    setSavingEquipo(true);
+    const tokenValue = await getToken();
+    if (!tokenValue) throw new Error("La sesión no está disponible.");
+    const form = new FormData();
+    const payload = {
+      ...equipoForm,
+      ruas: equipoForm.ruas.trim(),
+      serie: equipoForm.serie.trim(),
+      modelo: equipoForm.modelo.trim(),
+      horasVuelo: horas,
+      arrendado: equipoForm.arrendado,
+      estado: equipoForm.arrendado ? "Arrendado" : equipoForm.estado,
+    };
+    Object.entries(payload).forEach(([key, value]) => form.append(key, String(value ?? "")));
+    Object.entries(equipoFiles).forEach(([field, file]) => {
+      if (!file) return;
+      form.append(field, { uri: file.uri, name: file.name, type: file.mimeType } as any);
+    });
+    const path = editingEquipoId ? `/api/equipos/${editingEquipoId}` : "/api/equipos";
+    const response = await fetch(`${API_URL}${normalizePath(path)}`, {
+      method: editingEquipoId ? "PUT" : "POST",
+      headers: { Accept: "application/json", Authorization: `Bearer ${tokenValue}` },
+      body: form,
+    });
+    const raw = await response.text();
+    let result: any = {};
+    try { result = raw ? JSON.parse(raw) : {}; } catch {}
+    if (!response.ok) throw new Error(result?.message || `Error HTTP ${response.status}`);
+    setShowEquipoForm(false);
+    await loadEquipos();
+    Toast.show({
+      type: "success",
+      text1: editingEquipoId ? "UAS actualizado" : "UAS registrado",
+      text2: "La información de la aeronave quedó guardada.",
+    });
+  } catch (error: any) {
+    Toast.show({ type: "error", text1: "No se pudo guardar", text2: error?.message || "Intenta nuevamente." });
+  } finally {
+    setSavingEquipo(false);
+  }
+}, [editingEquipoId, equipoFiles, equipoForm, loadEquipos]);
+
+const deleteEquipo = useCallback((equipo: EquipoUAS) => {
+  Alert.alert(
+    "Eliminar aeronave",
+    `¿Deseas eliminar ${equipo.modelo || "este UAS"} · ${equipo.serie || "sin serie"}?`,
+    [
+      { text: "Cancelar", style: "cancel" },
+      {
+        text: "Eliminar",
+        style: "destructive",
+        onPress: async () => {
+          try {
+            await apiFetch(`/api/equipos/${equipo._id}`, { method: "DELETE" });
+            setEquipoSel((current) => current?._id === equipo._id ? null : current);
+            await loadEquipos();
+            Toast.show({ type: "success", text1: "UAS eliminado" });
+          } catch (error: any) {
+            Toast.show({ type: "error", text1: "No se pudo eliminar", text2: error?.message || "Revisa si tiene registros asociados." });
+          }
+        },
+      },
+    ]
+  );
+}, [loadEquipos]);
+
+const openEquipoDocument = useCallback(async (equipo: EquipoUAS, type: "poliza" | "ruas") => {
+  try {
+    const response = await apiFetch<{ url?: string }>(`/api/equipos/${equipo._id}/${type}/url`);
+    if (!response?.url) throw new Error(`El ${type === "poliza" ? "documento de póliza" : "certificado RUAS"} no está cargado.`);
+    await Linking.openURL(response.url);
+  } catch (error: any) {
+    Toast.show({ type: "error", text1: "Documento no disponible", text2: error?.message || "No se pudo abrir." });
+  }
+}, []);
+
+const openBatteryFormForEquipo = useCallback((equipo: EquipoUAS) => {
+  setBatteryForm({
+    equipoId: equipo._id,
+    nombre: "",
+    marca: "",
+    modelo: "",
+    serial: "",
+    ciclos: "0",
+    maxCiclos: "200",
+    fechaAdquisicion: "",
+    notas: "",
+  });
+  setShowBatteryForm(true);
+}, []);
+
+const saveBattery = useCallback(async () => {
+  if (!batteryForm.equipoId || !batteryForm.serial.trim()) {
+    Toast.show({ type: "error", text1: "Faltan datos", text2: "El serial de la batería es obligatorio." });
+    return;
+  }
+  try {
+    setSavingBattery(true);
+    await apiFetch("/api/baterias", {
+      method: "POST",
+      body: JSON.stringify({
+        ...batteryForm,
+        nombre: batteryForm.nombre.trim(),
+        serial: batteryForm.serial.trim(),
+        ciclos: Math.max(0, Number(batteryForm.ciclos || 0)),
+        maxCiclos: Math.max(1, Number(batteryForm.maxCiclos || 200)),
+      }),
+    });
+    setShowBatteryForm(false);
+    Toast.show({ type: "success", text1: "Batería registrada", text2: "Ya quedó asociada al UAS." });
+  } catch (error: any) {
+    Toast.show({ type: "error", text1: "No se pudo registrar", text2: error?.message || "Intenta nuevamente." });
+  } finally {
+    setSavingBattery(false);
+  }
+}, [batteryForm]);
+
+const openEquipoDatePicker = useCallback((
+  field: "polizaVigencia" | "polizaVence" | "fechaInicioArrendamiento" | "fechaFinArrendamiento"
+) => {
+  const raw = equipoForm[field];
+  const current = raw ? new Date(`${raw}T12:00:00`) : new Date();
+  DateTimePickerAndroid.open({
+    value: Number.isNaN(current.getTime()) ? new Date() : current,
+    mode: "date",
+    onChange: (event, selectedDate) => {
+      if (event.type === "dismissed" || !selectedDate) return;
+      setEquipoForm((prev) => ({ ...prev, [field]: formatDateOnly(selectedDate) }));
+    },
+  });
+}, [equipoForm]);
 
 useEffect(() => {
   if (section === "equipos-uas") {
@@ -4852,8 +5631,10 @@ useEffect(() => {
 const loadGpsAndWeather = useCallback(async () => {
   const REF_LAT = 4.711;
   const REF_LON = -74.0721;
-  const fallbackLat = lastGoodGpsRef.current.lat ?? gpsCell.lat ?? REF_LAT;
-  const fallbackLon = lastGoodGpsRef.current.lon ?? gpsCell.lon ?? REF_LON;
+  // La última posición válida vive en un ref para que actualizar el estado GPS
+  // no recree esta función ni dispare nuevamente el efecto meteorológico.
+  const fallbackLat = lastGoodGpsRef.current.lat ?? REF_LAT;
+  const fallbackLon = lastGoodGpsRef.current.lon ?? REF_LON;
 
   const fetchWeatherByCoords = async (lat: number, lon: number, reason?: string) => {
     try {
@@ -4912,7 +5693,7 @@ const loadGpsAndWeather = useCallback(async () => {
 
     const url =
       `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
-      "&current=temperature_2m,wind_speed_10m,wind_direction_10m,wind_gusts_10m,weather_code,relative_humidity_2m,surface_pressure,precipitation,rain,cloud_cover,visibility,shortwave_radiation" +
+      "&current=temperature_2m,wind_speed_10m,wind_direction_10m,wind_gusts_10m,weather_code,relative_humidity_2m,surface_pressure,precipitation,rain,cloud_cover,visibility,shortwave_radiation,is_day" +
       "&hourly=precipitation_probability,cloud_base" +
       "&forecast_days=3&timezone=auto";
 
@@ -4932,6 +5713,14 @@ const loadGpsAndWeather = useCallback(async () => {
     const visibilityM = toNumberOrNull(current?.visibility);
     const cloudCoverPct = toNumberOrNull(current?.cloud_cover);
     const radiationWm2 = toNumberOrNull(current?.shortwave_radiation);
+    const isDay = Number(current?.is_day) === 1;
+    const currentSkyLabel = deriveCurrentSkyLabel({
+      weatherCode,
+      cloudCoverPct,
+      radiationWm2,
+      rainMm,
+      isDay,
+    });
 
     const hourlyTimes: string[] = Array.isArray(data?.hourly?.time) ? data.hourly.time : [];
     const currentTime = typeof current?.time === "string" ? current.time : "";
@@ -5086,13 +5875,13 @@ const loadGpsAndWeather = useCallback(async () => {
 
     setWeatherNow({
       ok: true,
-      label: weatherCodeToEs(weatherCode),
+      label: currentSkyLabel,
       tempC,
       windMs,
     });
     setWeatherDetail({
       ok: true,
-      label: weatherCodeToEs(weatherCode),
+      label: currentSkyLabel,
       tempC,
       windMs,
       windDirDeg,
@@ -5111,7 +5900,7 @@ const loadGpsAndWeather = useCallback(async () => {
       satBlockedEstPct,
       flightState: evalResult.state,
       reasons: reason ? [reason, ...evalResult.reasons] : evalResult.reasons,
-      updatedAt: new Date().toISOString(),
+      updatedAt: currentTime || new Date().toISOString(),
     });
     setWeatherForecast(forecastRows);
   };
@@ -5142,7 +5931,7 @@ const loadGpsAndWeather = useCallback(async () => {
           } catch {}
         }
         pos = await withTimeout(
-          Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.Balanced }),
+          Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High }),
           12000
         );
         const pLat = Number(pos?.coords?.latitude);
@@ -5228,7 +6017,7 @@ const loadGpsAndWeather = useCallback(async () => {
       setWeatherForecast([]);
     }
   }
-}, [gpsCell.lat, gpsCell.lon]);
+}, []);
 
   const loadAll = useCallback(async () => {
   await Promise.all([
@@ -5256,8 +6045,14 @@ useEffect(() => {
     if (section === "weather") loadGpsAndWeather();
   }, [section, loadReportes, loadVuelos, loadMisiones, loadEquipos, loadGpsAndWeather, loadBitacoraSolicitudes]);
 
+  useFocusEffect(
+    useCallback(() => {
+      if (section === "missions") loadMisiones();
+    }, [loadMisiones, section])
+  );
+
   useEffect(() => {
-    if (section !== "weather") return;
+    if (section !== "weather" && section !== "dashboard") return;
     loadGpsAndWeather();
     const timer = setInterval(() => {
       loadGpsAndWeather();
@@ -6465,7 +7260,10 @@ const resetReporteForm = () => {
         return;
       }
 
-      const uploadResults = await uploadFlightLogsOnline(flightLogFiles);
+      const uploadResults = await uploadFlightLogsOnline(
+        flightLogFiles,
+        flightMisionId || activeMission?._id || missionToday?._id
+      );
       setFlightLogResults(uploadResults);
 
       const successfulServerIds = uploadResults
@@ -6489,6 +7287,18 @@ const resetReporteForm = () => {
           type: "error",
           text1: "Sin datos",
           text2: "Los logs se subieron, pero no se pudo construir el prellenado de la bitácora.",
+        });
+        return;
+      }
+
+      const consolidatedFlightLogIds = Array.isArray(prefill.flightLogIds)
+        ? prefill.flightLogIds.map((id: any) => String(id || "")).filter(Boolean)
+        : [];
+      if (!consolidatedFlightLogIds.length) {
+        Toast.show({
+          type: "error",
+          text1: "Sin logs válidos",
+          text2: "Los archivos no contienen vuelos que puedan consolidarse.",
         });
         return;
       }
@@ -6609,7 +7419,21 @@ const resetReporteForm = () => {
           ? Number(prefill.tiempoTotalVueloMin)
           : duracionMin,
         bateriasUtilizadas: String(prefill.bateriasUtilizadas || "").trim() || undefined,
-        payload: `${successfulServerIds.length} log(s) consolidados`,
+        bateriasDetalle: Array.isArray(prefill.bateriasDetalle) ? prefill.bateriasDetalle : undefined,
+        distanciaTotalM: Number.isFinite(Number(prefill.distanciaTotalM))
+          ? Number(prefill.distanciaTotalM)
+          : undefined,
+        velocidadPromedioMps: Number.isFinite(Number(prefill.velocidadPromedioMps))
+          ? Number(prefill.velocidadPromedioMps)
+          : undefined,
+        velocidadMaximaMps: Number.isFinite(Number(prefill.velocidadMaximaMps))
+          ? Number(prefill.velocidadMaximaMps)
+          : undefined,
+        fotografiasCapturadas: Number.isFinite(Number(prefill.fotografiasCapturadas))
+          ? Number(prefill.fotografiasCapturadas)
+          : undefined,
+        rutaConsolidada: Array.isArray(prefill.rutaConsolidada) ? prefill.rutaConsolidada : undefined,
+        payload: `${consolidatedFlightLogIds.length} log(s) consolidados`,
         checklistPrevueloRealizado: true,
         evaluacionRiesgos: "Sin hallazgos críticos reportados",
         zonaSeguraEstablecida: true,
@@ -6617,7 +7441,7 @@ const resetReporteForm = () => {
         descripcionNovedad: "Sin novedades registradas",
         accionesTomadas: "No se requirieron acciones correctivas",
         nombrePilotoResponsable: String(usuario?.nombre || "").trim() || undefined,
-        flightLogIds: successfulServerIds,
+        flightLogIds: consolidatedFlightLogIds,
         notas: [
           String(prefill.notas || "").trim(),
           prefill.maxSatellites != null ? `Máx. satélites detectados: ${prefill.maxSatellites}.` : "",
@@ -6633,11 +7457,15 @@ const resetReporteForm = () => {
         body: JSON.stringify(payload),
       });
 
-      const uploadedOk = uploadResults.filter((result) => result.ok).length;
       const uploadedFail = uploadResults.filter((result) => !result.ok).length;
-      const summary = uploadedFail
-        ? `Se creó la bitácora automática. Logs subidos: ${uploadedOk}. Fallidos: ${uploadedFail}.`
-        : `Se creó la bitácora automática con ${uploadedOk} log(s).`;
+      const rejected = Math.max(0, Number(prefill.logsRechazados || 0));
+      const identifiedBatteries = Array.isArray(prefill.bateriasDetalle)
+        ? prefill.bateriasDetalle.length
+        : 0;
+      const summary =
+        `Bitácora consolidada: ${duracionMin} min, ${consolidatedFlightLogIds.length} log(s)` +
+        `${identifiedBatteries ? `, ${identifiedBatteries} batería(s)` : ""}` +
+        `${rejected || uploadedFail ? `. No procesados: ${rejected + uploadedFail}` : ""}.`;
 
       Toast.show({ type: "success", text1: "OK", text2: summary });
 
@@ -6650,6 +7478,142 @@ const resetReporteForm = () => {
     }
   };
 
+
+const uploadAuthorizationAndSubmit = async (mission: Mision) => {
+  try {
+    const picked = await DocumentPicker.getDocumentAsync({
+      type: ["application/pdf", "image/*"],
+      multiple: false,
+      copyToCacheDirectory: true,
+    });
+    if (picked.canceled || !picked.assets?.[0]) return;
+    const file = picked.assets[0];
+    const form = new FormData();
+    form.append("autorizacionVuelo", {
+      uri: file.uri,
+      name: file.name || "autorizacion-vuelo.pdf",
+      type: file.mimeType || "application/pdf",
+    } as any);
+    const authToken = String(ctxToken || token || await getToken()).trim();
+    if (!authToken) throw new Error("La sesión venció.");
+    const response = await fetch(
+      `${API_URL}${normalizePath(`/api/misiones/${mission._id}/autorizacion/enviar-aprobacion`)}`,
+      {
+        method: "POST",
+        headers: { Accept: "application/json", Authorization: `Bearer ${authToken}` },
+        body: form,
+      }
+    );
+    const text = await response.text();
+    const data = text ? safeJsonParse(text) : {};
+    if (!response.ok) throw new Error(data?.message || "No se pudo enviar la autorización.");
+    Toast.show({ type: "success", text1: "Enviada para aprobación", text2: "El jefe de pilotos recibió la operación." });
+    await loadMisiones();
+  } catch (error: any) {
+    Toast.show({ type: "error", text1: "No se pudo enviar", text2: error?.message || "Intenta nuevamente." });
+  }
+};
+
+const approveMissionAuthorization = (mission: Mision) => {
+  Alert.alert(
+    "Aprobar operación",
+    `¿Confirmas la aprobación de ${mission.titulo || "esta operación"}?`,
+    [
+      { text: "Cancelar", style: "cancel" },
+      {
+        text: "Aprobar",
+        onPress: async () => {
+          try {
+            await apiFetch(`/api/misiones/${mission._id}/autorizacion/aprobar`, {
+              method: "PATCH",
+            });
+            Toast.show({ type: "success", text1: "Operación aprobada", text2: "La misión quedó programada." });
+            await loadMisiones();
+          } catch (error: any) {
+            Toast.show({ type: "error", text1: "No se pudo aprobar", text2: error?.message || "Revisa la autorización." });
+          }
+        },
+      },
+    ]
+  );
+};
+
+const uploadFieldDocument = async (type: "certificadoMedico" | "cipu" | "arl") => {
+  if (type === "certificadoMedico") {
+    if (
+      !/^\d{4}-\d{2}-\d{2}$/.test(medicalCertificateStart) ||
+      !/^\d{4}-\d{2}-\d{2}$/.test(medicalCertificateEnd) ||
+      medicalCertificateEnd < medicalCertificateStart
+    ) {
+      Toast.show({ type: "error", text1: "Fechas no válidas", text2: "Verifica la fecha inicial y la fecha de vencimiento." });
+      return;
+    }
+  }
+  try {
+    const picked = await DocumentPicker.getDocumentAsync({
+      type: ["application/pdf", "image/*"],
+      multiple: false,
+      copyToCacheDirectory: true,
+    });
+    if (picked.canceled || !picked.assets?.[0]) return;
+    setFieldDocumentBusy(type);
+    const file = picked.assets[0];
+    if (Number(file.size || 0) > 25 * 1024 * 1024) {
+      throw new Error("El archivo supera el tamaño máximo permitido de 25 MB.");
+    }
+    const form = new FormData();
+    form.append("docFile", {
+      uri: file.uri,
+      name: file.name || `${type}.pdf`,
+      type: file.mimeType || "application/pdf",
+    } as any);
+    if (type === "certificadoMedico") {
+      form.append("fechaInicio", medicalCertificateStart);
+      form.append("fechaVencimiento", medicalCertificateEnd);
+    }
+    const authToken = String(ctxToken || token || await getToken()).trim();
+    if (!authToken) throw new Error("La sesión venció.");
+    const response = await fetch(`${API_URL}${normalizePath(`/api/me/documentos-campo/${type}`)}`, {
+      method: "POST",
+      headers: { Accept: "application/json", Authorization: `Bearer ${authToken}` },
+      body: form,
+    });
+    const raw = await response.text();
+    const data = raw ? safeJsonParse(raw) : {};
+    if (!response.ok) {
+      throw new Error(
+        data?.message ||
+          data?.error ||
+          `El servidor respondió HTTP ${response.status} al cargar el documento.`
+      );
+    }
+    Toast.show({ type: "success", text1: "Documento actualizado", text2: "La certificación quedó guardada en tu perfil." });
+    await loadDashboard();
+  } catch (error: any) {
+    console.error("uploadFieldDocument:", {
+      type,
+      message: error?.message,
+      name: error?.name,
+    });
+    const detail =
+      error?.message === "Network request failed"
+        ? "No fue posible conectar con el servidor. Revisa Internet y la URL del backend."
+        : error?.message || "Intenta nuevamente.";
+    Toast.show({ type: "error", text1: "No se pudo cargar", text2: detail });
+  } finally {
+    setFieldDocumentBusy("");
+  }
+};
+
+const openFieldDocument = async (type: "certificadoMedico" | "cipu" | "arl") => {
+  try {
+    const response = await apiFetch<{ url?: string }>(`/api/me/documentos-campo/${type}/url`);
+    if (!response?.url) throw new Error("No se recibió el enlace del documento.");
+    await Linking.openURL(response.url);
+  } catch (error: any) {
+    Toast.show({ type: "error", text1: "No se pudo abrir", text2: error?.message || "Intenta nuevamente." });
+  }
+};
 
  const marcarMisionCumplida = async (misionId: string) => {
   try {
@@ -6669,11 +7633,12 @@ const resetReporteForm = () => {
     const online = !!net.isConnected && !!net.isInternetReachable;
 
     if (!online) {
-      Toast.show({
-        type: "error",
-        text1: "Sin conexión",
-        text2: "Para cerrar la misión y subir evidencias debes tener internet.",
-      });
+      setEvidenceMissionId(misionId);
+      setEvidenceNote("");
+      setEvidenceItems([]);
+      setEvidenceChecklist({ area: false, aeronave: false, equipo: false });
+      setShowEvidenceModal(true);
+      Toast.show({ type: "info", text1: "Cierre offline", text2: "Adjunta evidencias para guardar la finalización provisional." });
       return;
     }
 
@@ -6812,7 +7777,13 @@ const syncMisionCumplidaQueue = useCallback(async () => {
     const online = !!net.isConnected && !!net.isInternetReachable;
 
     if (!online) {
-      await enqueueProc(procMission._id, "preflight", payload);
+      await enqueueOfflineAction({
+        category: "procedure",
+        missionId: procMission._id,
+        endpoint: "/api/procedures/preflight",
+        method: "POST",
+        body: { ...payload, offlineProcedureKind: "preflight" },
+      });
 
       // ✅ marca en UI como completado “local”
       setProcStatusMap(prev => ({
@@ -6824,6 +7795,7 @@ const syncMisionCumplidaQueue = useCallback(async () => {
       }));
 
       Toast.show({ type:"success", text1:"Guardado (offline)", text2:"Preflight quedó pendiente." });
+      await loadSyncSummary();
       closeChecklist();
       if (guidedFlowMissionId === procMission._id) {
         setShowAutoevalModal(true);
@@ -6877,6 +7849,31 @@ async function saveAutoevaluacion() {
       clientId: makeLocalId("autoeval"),
     };
 
+    const net = await NetInfo.fetch();
+    const online = !!net.isConnected && !!net.isInternetReachable;
+    if (!online) {
+      await enqueueOfflineAction({
+        category: "procedure",
+        missionId: procMission._id,
+        endpoint: "/api/procedures/autoevaluacion",
+        method: "POST",
+        body: { ...payload, offlineProcedureKind: "autoeval" },
+      });
+      setProcStatusMap((prev) => ({
+        ...prev,
+        [procMission._id]: {
+          ...(prev[procMission._id] || { preflight: false, autoeval: false, battery: false }),
+          autoeval: true,
+        },
+      }));
+      Toast.show({ type: "success", text1: "Guardado offline", text2: "Autoevaluación pendiente de sincronización." });
+      closeAutoeval();
+      if (guidedFlowMissionId === procMission._id) setShowBatteryModal(true);
+      else setProcMission(null);
+      await loadSyncSummary();
+      return;
+    }
+
     const r = await apiFetch<ApiOk>("/api/procedures/autoevaluacion", {
       method: "POST",
       body: JSON.stringify(payload),
@@ -6921,6 +7918,33 @@ async function saveBatteryChecklist() {
       origen: "app",
       clientId: makeLocalId("battery"),
     };
+
+    const net = await NetInfo.fetch();
+    const online = !!net.isConnected && !!net.isInternetReachable;
+    if (!online) {
+      await enqueueOfflineAction({
+        category: "procedure",
+        missionId: procMission._id,
+        endpoint: "/api/procedures/battery",
+        method: "POST",
+        body: { ...payload, offlineProcedureKind: "battery" },
+      });
+      setProcStatusMap((prev) => ({
+        ...prev,
+        [procMission._id]: {
+          ...(prev[procMission._id] || { preflight: false, autoeval: false, battery: false }),
+          battery: true,
+        },
+      }));
+      Toast.show({ type: "success", text1: "Guardado offline", text2: "Variables críticas pendientes de sincronización." });
+      closeBattery();
+      if (guidedFlowMissionId === procMission._id) {
+        const missionDone = (misiones || []).find((m) => m._id === procMission._id) || procMission;
+        openOperationFlow(missionDone);
+      } else setProcMission(null);
+      await loadSyncSummary();
+      return;
+    }
 
     const r = await apiFetch<ApiOk>("/api/procedures/battery", {
       method: "POST",
@@ -6973,11 +7997,48 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
   const online = !!net.isConnected && !!net.isInternetReachable;
 
   if (!online) {
-    Toast.show({
-      type: "error",
-      text1: "Sin conexión",
-      text2: "No puedes cerrar misión sin internet.",
-    });
+    if (!evidenceItems.length) {
+      Toast.show({ type: "error", text1: "Evidencias requeridas", text2: "Debes adjuntar al menos una evidencia." });
+      return;
+    }
+    if (!Object.values(evidenceChecklist).every(Boolean)) {
+      Toast.show({ type: "error", text1: "Checklist visual", text2: "Completa la validación visual." });
+      return;
+    }
+    setSavingEvidence(true);
+    try {
+      const persisted = await persistOfflineFiles(
+        evidenceItems.map((item) => ({ uri: item.uri, name: item.name, mimeType: item.mime })),
+        "files"
+      );
+      await enqueueOfflineAction({
+        category: "evidence",
+        missionId: evidenceMissionId,
+        endpoint: `/api/misiones/${evidenceMissionId}/evidencias`,
+        method: "POST",
+        body: { note: evidenceNote.trim() },
+        files: persisted,
+      });
+      await enqueueOfflineAction({
+        category: "mission",
+        missionId: evidenceMissionId,
+        endpoint: `/api/misiones/${evidenceMissionId}/cumplida`,
+        method: "PATCH",
+        body: { finalizacionProvisional: true },
+      });
+      markOperationStatus(evidenceMissionId, { finalized: true });
+      closeEvidenceModal();
+      await loadSyncSummary();
+      Toast.show({
+        type: "success",
+        text1: "Misión finalizada offline",
+        text2: "Evidencias y cierre pendientes de sincronización.",
+      });
+    } catch (error: any) {
+      Toast.show({ type: "error", text1: "No se pudo guardar offline", text2: error?.message || "Intenta nuevamente." });
+    } finally {
+      setSavingEvidence(false);
+    }
     return;
   }
 
@@ -7020,7 +8081,7 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
   } finally {
     setSavingEvidence(false);
   }
-}, [closeEvidenceModal, evidenceChecklist, evidenceMissionId, evidenceNote, evidenceItems, loadDashboard, loadMisiones, markOperationStatus]);
+}, [closeEvidenceModal, evidenceChecklist, evidenceMissionId, evidenceNote, evidenceItems, loadDashboard, loadMisiones, loadSyncSummary, markOperationStatus]);
 
   const alfabotWaveScale1 = alfabotWave1.interpolate({ inputRange: [0, 1], outputRange: [1, 1.45] });
   const alfabotWaveOpacity1 = alfabotWave1.interpolate({ inputRange: [0, 1], outputRange: [0.9, 0] });
@@ -7262,10 +8323,24 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
             <View style={styles.heroRight}>
               <Pressable
                 style={styles.heroIconBtn}
-                onPress={() => navigation.navigate("QrScan")}
-
+                onPress={() => setShowPilotNotifications(true)}
+                accessibilityRole="button"
+                accessibilityLabel={`${pilotNotifications.length} notificaciones`}
               >
-                <Ionicons name="qr-code" size={22} color="#ffffff" />
+                <Animated.View style={{ transform: [{ rotate: notificationBellRotate }] }}>
+                  <Ionicons
+                    name={pilotNotifications.length ? "notifications" : "notifications-outline"}
+                    size={23}
+                    color="#ffffff"
+                  />
+                </Animated.View>
+                {!!pilotNotifications.length && (
+                  <View style={styles.notificationBadge}>
+                    <Text style={styles.notificationBadgeText}>
+                      {pilotNotifications.length > 9 ? "9+" : pilotNotifications.length}
+                    </Text>
+                  </View>
+                )}
               </Pressable>
 
               <Pressable
@@ -7279,10 +8354,12 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
             </View>
           </View>
 
-          <View style={styles.bannerCard}>
+          <View style={[styles.bannerCard, isFlyNorthCompany && styles.flyNorthBannerCard]}>
             <Image
               source={
-                typeof logoSource === "number"
+                isFlyNorthCompany
+                  ? FLYNORTH_BANNER_LOGO
+                  : typeof logoSource === "number"
                   ? logoSource
                   : typeof logoSource === "string"
                   ? { uri: logoSource }
@@ -7290,22 +8367,88 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                   ? logoSource
                   : PILOT_PANEL_BANNER_LOGO
               }
-              style={styles.bannerImg}
-              resizeMode="cover"
+              style={[styles.bannerImg, isFlyNorthCompany && styles.flyNorthBannerImg]}
+              resizeMode={isFlyNorthCompany ? "contain" : "cover"}
             />
-            <View style={styles.bannerOverlay}>
-              <Text style={styles.bannerTitle}>{title}</Text>
-              <Text style={styles.bannerText}>Checklist, bitácoras y reportes SMS en un solo lugar.</Text>
-            </View>
+            {!isFlyNorthCompany && (
+              <View style={styles.bannerOverlay}>
+                <Text style={styles.bannerTitle}>{title}</Text>
+                <Text style={styles.bannerText}>Checklist, bitácoras y reportes SMS en un solo lugar.</Text>
+              </View>
+            )}
           </View>
         </LinearGradient>
 
+        <Modal
+          visible={showPilotNotifications}
+          transparent
+          animationType="fade"
+          statusBarTranslucent
+          onRequestClose={() => setShowPilotNotifications(false)}
+        >
+          <Pressable style={styles.notificationOverlay} onPress={() => setShowPilotNotifications(false)}>
+            <Pressable style={styles.notificationSheet} onPress={() => {}}>
+              <View style={styles.modalHeader}>
+                <View>
+                  <Text style={styles.modalTitle}>Notificaciones</Text>
+                  <Text style={styles.notificationSubtitle}>
+                    {pilotNotifications.length
+                      ? `${pilotNotifications.length} novedad${pilotNotifications.length === 1 ? "" : "es"} por revisar`
+                      : "Todo está al día"}
+                  </Text>
+                </View>
+                <Pressable style={styles.notificationClose} onPress={() => setShowPilotNotifications(false)}>
+                  <Ionicons name="close" size={22} color="#111918" />
+                </Pressable>
+              </View>
+
+              <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingVertical: 8 }}>
+                {!pilotNotifications.length ? (
+                  <View style={styles.notificationEmpty}>
+                    <Ionicons name="notifications-off-outline" size={34} color="#7a8b9a" />
+                    <Text style={styles.notificationEmptyTitle}>Sin notificaciones</Text>
+                    <Text style={styles.notificationEmptyText}>No tienes alertas ni misiones pendientes.</Text>
+                  </View>
+                ) : (
+                  pilotNotifications.map((item) => (
+                    <View key={item.id} style={styles.notificationRow}>
+                      <View
+                        style={[
+                          styles.notificationIcon,
+                          item.tone === "danger"
+                            ? styles.notificationIconDanger
+                            : item.tone === "warning"
+                              ? styles.notificationIconWarning
+                              : styles.notificationIconInfo,
+                        ]}
+                      >
+                        <MaterialCommunityIcons name={item.icon} size={21} color="#ffffff" />
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.notificationTitle}>{item.title}</Text>
+                        <Text style={styles.notificationDetail}>{item.detail}</Text>
+                      </View>
+                    </View>
+                  ))
+                )}
+              </ScrollView>
+            </Pressable>
+          </Pressable>
+        </Modal>
+
         {/* CONTENT */}
-        <ScrollView
+        <KeyboardAvoidingView
+          style={{ flex: 1 }}
+          behavior={Platform.OS === "ios" ? "padding" : undefined}
+          keyboardVerticalOffset={Platform.OS === "ios" ? insets.top : 0}
+        >
+          <ScrollView
             style={styles.content}
             scrollEnabled={!dashboardMapTouchActive}
-            contentContainerStyle={{ paddingBottom: insets.bottom + 120 }}
+            contentContainerStyle={{ paddingBottom: insets.bottom + 180 }}
             keyboardShouldPersistTaps="handled"
+            keyboardDismissMode={Platform.OS === "ios" ? "interactive" : "on-drag"}
+            automaticallyAdjustKeyboardInsets
             showsVerticalScrollIndicator={false}
             refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} />}
           >
@@ -7374,11 +8517,12 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                         <View style={{ flex: 1 }}>
                           {dashboardMapHtml ? (
                             <WebView
-                              key={`${dashboardMapCenter?.latitude ?? "na"}-${dashboardMapCenter?.longitude ?? "na"}`}
+                              key={`arcgis-imagery-v1-${dashboardMapCenter?.latitude ?? "na"}-${dashboardMapCenter?.longitude ?? "na"}`}
                               originWhitelist={["*"]}
                               source={{ html: dashboardMapHtml }}
                               javaScriptEnabled
                               domStorageEnabled
+                              cacheEnabled={false}
                               scrollEnabled={false}
                               nestedScrollEnabled
                             />
@@ -7392,7 +8536,7 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                       </TouchableWithoutFeedback>
 
                       <View style={styles.airMapTopLeft}>
-                        <Text style={styles.airMapBadgeText}>Tiempo real</Text>
+                        <Text style={styles.airMapBadgeText}>ArcGIS · Satélite</Text>
                       </View>
 
                       <Pressable
@@ -7476,6 +8620,20 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                       </Pressable>
                     ))}
                   </View>
+
+                  <Pressable
+                    style={styles.screenBroadcastCard}
+                    onPress={() => navigation.navigate("ScreenBroadcast")}
+                  >
+                    <View style={styles.screenBroadcastIcon}>
+                      <MaterialCommunityIcons name="broadcast" size={26} color="#ffffff" />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                      <Text style={styles.screenBroadcastTitle}>Transmitir pantalla</Text>
+                      <Text style={styles.screenBroadcastText}>Emisión en vivo desde un control DJI RC Plus</Text>
+                    </View>
+                    <Ionicons name="chevron-forward" size={22} color="#0799c1" />
+                  </Pressable>
 
                   {false && (
                   <View style={styles.card}>
@@ -7680,6 +8838,131 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                   </View>
 
                   <View style={styles.card}>
+                    <Text style={styles.cardTitle}>Certificaciones para operación en campo</Text>
+                    <Text style={[styles.muted, { marginBottom: 12 }]}>
+                      Disponible para pilotos y jefes de pilotos. La vigencia operacional del CIPU depende del certificado médico.
+                    </Text>
+
+                    <View style={styles.fieldDocCard}>
+                      <View style={styles.rowBetween}>
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.fieldDocTitle}>Certificado médico</Text>
+                          <Text style={styles.fieldDocMeta}>
+                            {usuario?.documentosCampo?.certificadoMedico?.name || "Sin archivo"}
+                          </Text>
+                        </View>
+                        <View style={[styles.missionRelationBadge, certStatus.label === "Vigente" ? styles.missionApprovalApproved : styles.missionApprovalPending]}>
+                          <Text style={styles.missionRelationText}>{certStatus.label}</Text>
+                        </View>
+                      </View>
+                      <View style={[styles.row, { marginTop: 10 }]}>
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.kLabel}>Fecha de inicio</Text>
+                          <Pressable
+                            style={[styles.input, styles.datePressable]}
+                            onPress={() => openMedicalDatePicker("start")}
+                          >
+                            <Text style={{ color: medicalCertificateStart ? "#1b2b3a" : "#8a96a3", flex: 1 }}>
+                              {medicalCertificateStart || "Seleccionar fecha"}
+                            </Text>
+                            <Ionicons name="calendar-outline" size={18} color="#111918" />
+                          </Pressable>
+                          {Platform.OS === "ios" && showMedicalStartDate ? (
+                            <DateTimePicker
+                              value={dateFromYmd(medicalCertificateStart)}
+                              mode="date"
+                              display={Platform.OS === "ios" ? "compact" : "default"}
+                              onChange={(event: DateTimePickerEvent, selected?: Date) => {
+                                setShowMedicalStartDate(false);
+                                if (event.type === "dismissed" || !selected) return;
+                                setMedicalCertificateStart(formatDateOnly(selected));
+                              }}
+                            />
+                          ) : null}
+                        </View>
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.kLabel}>Fecha de vencimiento</Text>
+                          <Pressable
+                            style={[styles.input, styles.datePressable]}
+                            onPress={() => openMedicalDatePicker("end")}
+                          >
+                            <Text style={{ color: medicalCertificateEnd ? "#1b2b3a" : "#8a96a3", flex: 1 }}>
+                              {medicalCertificateEnd || "Seleccionar fecha"}
+                            </Text>
+                            <Ionicons name="calendar-outline" size={18} color="#111918" />
+                          </Pressable>
+                          {Platform.OS === "ios" && showMedicalEndDate ? (
+                            <DateTimePicker
+                              value={dateFromYmd(medicalCertificateEnd || medicalCertificateStart)}
+                              minimumDate={medicalCertificateStart ? dateFromYmd(medicalCertificateStart) : undefined}
+                              mode="date"
+                              display={Platform.OS === "ios" ? "compact" : "default"}
+                              onChange={(event: DateTimePickerEvent, selected?: Date) => {
+                                setShowMedicalEndDate(false);
+                                if (event.type === "dismissed" || !selected) return;
+                                setMedicalCertificateEnd(formatDateOnly(selected));
+                              }}
+                            />
+                          ) : null}
+                        </View>
+                      </View>
+                      <View style={styles.fieldDocActions}>
+                        <Pressable style={styles.btnPrimary} disabled={!!fieldDocumentBusy} onPress={() => uploadFieldDocument("certificadoMedico")}>
+                          {fieldDocumentBusy === "certificadoMedico" ? <ActivityIndicator color="#fff" /> : <Ionicons name="cloud-upload-outline" size={16} color="#fff" />}
+                          <Text style={styles.btnPrimaryText}>Cargar certificado</Text>
+                        </Pressable>
+                        {usuario?.documentosCampo?.certificadoMedico?.key ? (
+                          <Pressable style={styles.btnOutline} onPress={() => openFieldDocument("certificadoMedico")}>
+                            <Text style={styles.btnOutlineText}>Ver</Text>
+                          </Pressable>
+                        ) : null}
+                      </View>
+                    </View>
+
+                    {([
+                      { type: "cipu" as const, title: "CIPU", icon: "card-account-details-outline" as const },
+                      { type: "arl" as const, title: "ARL", icon: "shield-account-outline" as const },
+                    ]).map((item) => {
+                      const document = usuario?.documentosCampo?.[item.type];
+                      const cipuOperational =
+                        item.type !== "cipu" ||
+                        (certStatus.label !== "Vencido" && certStatus.label !== "—");
+                      return (
+                        <View key={item.type} style={styles.fieldDocCard}>
+                          <View style={styles.rowBetween}>
+                            <View style={styles.fieldDocHeading}>
+                              <MaterialCommunityIcons name={item.icon} size={20} color="#111918" />
+                              <View style={{ flex: 1 }}>
+                                <Text style={styles.fieldDocTitle}>{item.title}</Text>
+                                <Text style={styles.fieldDocMeta}>{document?.name || "Sin archivo"}</Text>
+                              </View>
+                            </View>
+                            <View style={[styles.missionRelationBadge, document?.key && cipuOperational ? styles.missionApprovalApproved : styles.missionApprovalPending]}>
+                              <Text style={styles.missionRelationText}>
+                                {!document?.key ? "Pendiente" : cipuOperational ? "Disponible" : "Médico vencido"}
+                              </Text>
+                            </View>
+                          </View>
+                          {item.type === "cipu" && document?.key && !cipuOperational ? (
+                            <Text style={styles.warningInline}>El CIPU no figura vigente para campo mientras el certificado médico esté vencido.</Text>
+                          ) : null}
+                          <View style={styles.fieldDocActions}>
+                            <Pressable style={styles.btnPrimary} disabled={!!fieldDocumentBusy} onPress={() => uploadFieldDocument(item.type)}>
+                              {fieldDocumentBusy === item.type ? <ActivityIndicator color="#fff" /> : <Ionicons name="cloud-upload-outline" size={16} color="#fff" />}
+                              <Text style={styles.btnPrimaryText}>Cargar {item.title}</Text>
+                            </Pressable>
+                            {document?.key ? (
+                              <Pressable style={styles.btnOutline} onPress={() => openFieldDocument(item.type)}>
+                                <Text style={styles.btnOutlineText}>Ver</Text>
+                              </Pressable>
+                            ) : null}
+                          </View>
+                        </View>
+                      );
+                    })}
+                  </View>
+
+                  <View style={styles.card}>
                     <Text style={styles.cardTitle}>Perfil del piloto</Text>
                     <View style={styles.kvRow}>
                       <KVP label="Documento" value={usuario?.documento || "—"} icon="card-bulleted-outline" />
@@ -7746,6 +9029,18 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                     </>
                   )}
                 </>
+              )}
+
+              {section === "chief-management" && isChiefPilotRole && (
+                <ChiefManagementScreen
+                  embedded
+                  onNavigate={(nextSection, moduleKey) => {
+                    if (nextSection === "equipos-uas") {
+                      setEquiposViewMode(moduleKey === "hours" ? "hours" : "fleet");
+                    }
+                    goSection(nextSection as Section);
+                  }}
+                />
               )}
 
               {section === "ops-summary" && (
@@ -7818,18 +9113,27 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                   <View style={styles.card}>
                     <View style={styles.rowBetween}>
                       <View style={{ flex: 1, paddingRight: 10 }}>
-                        <Text style={styles.cardTitle}>Flota registrada</Text>
+                        <Text style={styles.cardTitle}>
+                          {equiposViewMode === "hours" ? "Control de horas UAS" : "Flota registrada"}
+                        </Text>
                         <Text style={styles.muted}>
-                          Aquí ves los drones de la empresa a la que estás vinculado y que están disponibles para operación.
+                          {equiposViewMode === "hours"
+                            ? "Consulta las horas acumuladas y la proximidad del mantenimiento de cada aeronave."
+                            : "Aquí ves los drones de la empresa a la que estás vinculado y que están disponibles para operación."}
                         </Text>
                       </View>
-                      <Pressable
-                        style={styles.btnOutline}
-                        onPress={() => loadEquipos()}
-                      >
-                        <Ionicons name="refresh" size={16} color="#111918" />
-                        <Text style={styles.btnOutlineText}>Actualizar</Text>
-                      </Pressable>
+                      <View style={{ alignItems: "flex-end" }}>
+                        {isChiefPilotRole && equiposViewMode === "fleet" ? (
+                          <Pressable style={styles.btnPrimary} onPress={() => resetEquipoForm(null)}>
+                            <Ionicons name="add" size={17} color="#fff" />
+                            <Text style={styles.btnPrimaryText}>Nuevo UAS</Text>
+                          </Pressable>
+                        ) : null}
+                        <Pressable style={[styles.btnOutline, { marginTop: isChiefPilotRole && equiposViewMode === "fleet" ? 8 : 0 }]} onPress={() => loadEquipos()}>
+                          <Ionicons name="refresh" size={16} color="#111918" />
+                          <Text style={styles.btnOutlineText}>Actualizar</Text>
+                        </Pressable>
+                      </View>
                     </View>
 
                     {loadingEquipos ? (
@@ -7871,14 +9175,16 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                                     {equipo.ruas || "Sin RUAS"}
                                   </Text>
                                 </View>
-                                <View style={styles.equipoCardBadge}>
-                                  <Text style={styles.equipoCardBadgeText}>
-                                    {equipo.estado || "Operativo"}
-                                  </Text>
-                                </View>
+                                {equiposViewMode === "fleet" ? (
+                                  <View style={styles.equipoCardBadge}>
+                                    <Text style={styles.equipoCardBadgeText}>
+                                      {equipo.estado || "Operativo"}
+                                    </Text>
+                                  </View>
+                                ) : null}
                               </View>
 
-                              <View style={styles.equipoCardMetaGrid}>
+                              {equiposViewMode === "fleet" ? <View style={styles.equipoCardMetaGrid}>
                                 <View style={styles.equipoCardMetaItem}>
                                   <Text style={styles.equipoCardMetaLabel}>Serie</Text>
                                   <Text style={styles.equipoCardMetaValue}>
@@ -7893,7 +9199,183 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                                       : "Sin dato"}
                                   </Text>
                                 </View>
-                              </View>
+                              </View> : null}
+                              {equiposViewMode === "fleet" ? (
+                                <View style={styles.uasOperationalDetails}>
+                                  <View style={styles.rowBetween}>
+                                    <View>
+                                      <Text style={styles.equipoCardMetaLabel}>Póliza</Text>
+                                      <Text style={styles.equipoCardMetaValue}>
+                                        {equipo.polizaPdf?.key ? equipo.polizaPdf?.name || "Cargada" : "—"}
+                                      </Text>
+                                    </View>
+                                    <View style={[
+                                      styles.hoursStatusBadge,
+                                      { backgroundColor: equipo.polizaPdf?.key ? "#dcfce7" : "#eef2f6" },
+                                    ]}>
+                                      <Text style={[
+                                        styles.hoursStatusText,
+                                        { color: equipo.polizaPdf?.key ? "#15803d" : "#334155" },
+                                      ]}>
+                                        {equipo.polizaPdf?.key ? "Con póliza" : "Sin póliza"}
+                                      </Text>
+                                    </View>
+                                  </View>
+                                  <Text style={styles.uasValidityText}>
+                                    Vigencia: {equipo.polizaVigencia ? formatDateOnly(equipo.polizaVigencia) : "—"} · Vence: {equipo.polizaVence ? formatDateOnly(equipo.polizaVence) : "—"}
+                                  </Text>
+
+                                  <Pressable
+                                    style={[styles.btnOutline, { alignSelf: "flex-start", marginTop: 9 }]}
+                                    onPress={() => setExpandedEquipoIds((prev) => ({ ...prev, [equipo._id]: prev[equipo._id] === false }))}
+                                  >
+                                    <Ionicons name={expandedEquipoIds[equipo._id] === false ? "chevron-down" : "chevron-up"} size={17} color="#111918" />
+                                    <Text style={styles.btnOutlineText}>{expandedEquipoIds[equipo._id] === false ? "Mostrar" : "Ocultar"}</Text>
+                                  </Pressable>
+
+                                  {expandedEquipoIds[equipo._id] !== false ? (
+                                    <View style={styles.uasActionStack}>
+                                      <Pressable style={styles.uasWideAction} onPress={() => openBatteryFormForEquipo(equipo)}>
+                                        <Ionicons name="battery-charging-outline" size={17} color="#111918" />
+                                        <Text style={styles.uasWideActionText}>Registrar Batería</Text>
+                                      </Pressable>
+                                      <Pressable style={styles.uasWideAction} onPress={() => openEquipoDocument(equipo, "poliza")}>
+                                        <Ionicons name="download-outline" size={17} color="#111918" />
+                                        <Text style={styles.uasWideActionText}>Descargar póliza</Text>
+                                      </Pressable>
+                                      <Pressable style={styles.uasWideAction} onPress={() => openEquipoDocument(equipo, "ruas")}>
+                                        <Ionicons name="download-outline" size={17} color="#111918" />
+                                        <Text style={styles.uasWideActionText}>Descargar RUAS</Text>
+                                      </Pressable>
+                                      <Pressable
+                                        style={styles.uasWideAction}
+                                        onPress={() => {
+                                          const url = String(equipo.manualUsuarioLink || "").trim();
+                                          if (!url) {
+                                            Toast.show({ type: "info", text1: "Manual no disponible", text2: "Registra el enlace desde Editar UAS." });
+                                            return;
+                                          }
+                                          Linking.openURL(url).catch(() => Toast.show({ type: "error", text1: "No se pudo abrir el manual" }));
+                                        }}
+                                      >
+                                        <Ionicons name="link-outline" size={17} color="#111918" />
+                                        <Text style={styles.uasWideActionText}>Abrir manual</Text>
+                                      </Pressable>
+                                    </View>
+                                  ) : null}
+                                </View>
+                              ) : null}
+                              {equiposViewMode === "hours" ? (() => {
+                                const metrics = getMaintenanceMetrics(equipo);
+                                const tone =
+                                  metrics.estado === "VENCIDO"
+                                    ? { bg: "#fee2e2", fg: "#b91c1c", label: "VENCIDO" }
+                                    : metrics.estado === "PRONTO"
+                                      ? { bg: "#ffedd5", fg: "#c2410c", label: "PRONTO" }
+                                      : { bg: "#dcfce7", fg: "#15803d", label: "OK" };
+                                const config = maintenanceConfigMap[equipo._id] || {
+                                  intervaloHoras: String(equipo.mantIntervaloHoras ?? 250),
+                                  umbralAviso: String(equipo.mantUmbralAviso ?? 25),
+                                  ultimaMantHoras: String(equipo.mantUltimaHora ?? 0),
+                                };
+                                return (
+                                  <View style={styles.hoursControlBlock}>
+                                    <Text style={styles.hoursSeries}>Serie: {equipo.serie || "—"}</Text>
+                                    <View style={[styles.rowBetween, { marginTop: 13 }]}>
+                                      <Text style={styles.hoursCurrent}>Horas actuales: <Text style={styles.hoursStrong}>{metrics.actuales.toFixed(1)}</Text></Text>
+                                      <View style={[styles.hoursStatusBadge, { backgroundColor: tone.bg }]}>
+                                        <Text style={[styles.hoursStatusText, { color: tone.fg }]}>{tone.label}</Text>
+                                      </View>
+                                    </View>
+
+                                    <View style={[styles.equipoCardMetaGrid, { marginTop: 14 }]}>
+                                      <View style={styles.equipoCardMetaItem}>
+                                        <Text style={styles.equipoCardMetaLabel}>Próximo mant.</Text>
+                                        <Text style={styles.hoursMetricValue}>{metrics.proximo.toFixed(0)} h</Text>
+                                      </View>
+                                      <View style={styles.equipoCardMetaItem}>
+                                        <Text style={styles.equipoCardMetaLabel}>Faltan</Text>
+                                        <Text style={styles.hoursMetricValue}>{metrics.restantes.toFixed(1)} h</Text>
+                                      </View>
+                                    </View>
+
+                                    <View style={styles.hoursInputsRow}>
+                                      {([
+                                        ["intervaloHoras", "Cambio cada (h)"],
+                                        ["umbralAviso", "Avisar faltando (h)"],
+                                      ] as const).map(([field, label], index) => (
+                                        <View key={field} style={[styles.hoursInputColumn, index === 0 && { marginRight: 8 }]}>
+                                          <Text style={styles.equipoCardMetaLabel}>{label}</Text>
+                                          <TextInput
+                                            value={config[field]}
+                                            onChangeText={(value) => setMaintenanceConfigMap((prev) => ({
+                                              ...prev,
+                                              [equipo._id]: { ...config, [field]: value },
+                                            }))}
+                                            keyboardType="decimal-pad"
+                                            style={[styles.input, { marginTop: 5 }]}
+                                            placeholder="0"
+                                            placeholderTextColor="#8c9aaa"
+                                          />
+                                        </View>
+                                      ))}
+                                    </View>
+
+                                    <View style={{ marginTop: 9 }}>
+                                      <Text style={styles.equipoCardMetaLabel}>Último mantenimiento (a las h)</Text>
+                                      <TextInput
+                                        value={config.ultimaMantHoras}
+                                        onChangeText={(value) => setMaintenanceConfigMap((prev) => ({
+                                          ...prev,
+                                          [equipo._id]: { ...config, ultimaMantHoras: value },
+                                        }))}
+                                        keyboardType="decimal-pad"
+                                        style={[styles.input, { marginTop: 5 }]}
+                                        placeholder="0"
+                                        placeholderTextColor="#8c9aaa"
+                                      />
+                                    </View>
+
+                                    <View style={{ flexDirection: "row", marginTop: 12 }}>
+                                      <Pressable
+                                        style={[styles.btnOutline, { flex: 1, justifyContent: "center", marginRight: 8 }]}
+                                        onPress={() => loadEquipos()}
+                                      >
+                                        <Ionicons name="flash-outline" size={17} color="#111918" />
+                                        <Text style={styles.btnOutlineText}>Recalcular</Text>
+                                      </Pressable>
+                                      <Pressable
+                                        style={[styles.btnOutline, { flex: 1, justifyContent: "center", opacity: savingMaintenanceId === equipo._id ? 0.65 : 1 }]}
+                                        disabled={savingMaintenanceId === equipo._id}
+                                        onPress={() => saveMaintenanceConfig(equipo)}
+                                      >
+                                        {savingMaintenanceId === equipo._id
+                                          ? <ActivityIndicator color="#111918" />
+                                          : <Ionicons name="save-outline" size={17} color="#111918" />}
+                                        <Text style={styles.btnOutlineText}>Guardar</Text>
+                                      </Pressable>
+                                    </View>
+                                  </View>
+                                );
+                              })() : null}
+                              {isChiefPilotRole && equiposViewMode === "fleet" ? (
+                                <View style={{ flexDirection: "row", marginTop: 12 }}>
+                                  <Pressable
+                                    style={[styles.btnOutline, { flex: 1, justifyContent: "center", marginRight: 8 }]}
+                                    onPress={() => resetEquipoForm(equipo)}
+                                  >
+                                    <Ionicons name="create-outline" size={16} color="#111918" />
+                                    <Text style={styles.btnOutlineText}>Editar</Text>
+                                  </Pressable>
+                                  <Pressable
+                                    style={[styles.btnOutline, { flex: 1, justifyContent: "center", borderColor: "#fecaca" }]}
+                                    onPress={() => deleteEquipo(equipo)}
+                                  >
+                                    <Ionicons name="trash-outline" size={17} color="#dc2626" />
+                                    <Text style={[styles.btnOutlineText, { color: "#dc2626" }]}>Eliminar</Text>
+                                  </Pressable>
+                                </View>
+                              ) : null}
                             </View>
                           </View>
                         ))}
@@ -7905,6 +9387,131 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
 
               {section === "pilot-profile" && (
                 <>
+                  <View style={styles.card}>
+                    <Text style={styles.cardTitle}>Documentos para operación en campo</Text>
+                    <Text style={[styles.muted, { marginBottom: 12 }]}>
+                      Carga y consulta aquí tus certificaciones. La vigencia del CIPU está vinculada al certificado médico.
+                    </Text>
+
+                    <View style={styles.fieldDocCard}>
+                      <View style={styles.rowBetween}>
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.fieldDocTitle}>Certificado médico</Text>
+                          <Text style={styles.fieldDocMeta}>
+                            {usuario?.documentosCampo?.certificadoMedico?.name || "Sin archivo"}
+                          </Text>
+                        </View>
+                        <View style={[styles.missionRelationBadge, certStatus.label === "Vigente" ? styles.missionApprovalApproved : styles.missionApprovalPending]}>
+                          <Text style={styles.missionRelationText}>{certStatus.label}</Text>
+                        </View>
+                      </View>
+                      <View style={[styles.row, { marginTop: 10 }]}>
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.kLabel}>Fecha de inicio</Text>
+                          <Pressable
+                            style={[styles.input, styles.datePressable]}
+                            onPress={() => openMedicalDatePicker("start")}
+                          >
+                            <Text style={{ color: medicalCertificateStart ? "#1b2b3a" : "#8a96a3", flex: 1 }}>
+                              {medicalCertificateStart || "Seleccionar fecha"}
+                            </Text>
+                            <Ionicons name="calendar-outline" size={18} color="#111918" />
+                          </Pressable>
+                          {Platform.OS === "ios" && showMedicalStartDate ? (
+                            <DateTimePicker
+                              value={dateFromYmd(medicalCertificateStart)}
+                              mode="date"
+                              display={Platform.OS === "ios" ? "compact" : "default"}
+                              onChange={(event: DateTimePickerEvent, selected?: Date) => {
+                                setShowMedicalStartDate(false);
+                                if (event.type === "dismissed" || !selected) return;
+                                setMedicalCertificateStart(formatDateOnly(selected));
+                              }}
+                            />
+                          ) : null}
+                        </View>
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.kLabel}>Fecha de vencimiento</Text>
+                          <Pressable
+                            style={[styles.input, styles.datePressable]}
+                            onPress={() => openMedicalDatePicker("end")}
+                          >
+                            <Text style={{ color: medicalCertificateEnd ? "#1b2b3a" : "#8a96a3", flex: 1 }}>
+                              {medicalCertificateEnd || "Seleccionar fecha"}
+                            </Text>
+                            <Ionicons name="calendar-outline" size={18} color="#111918" />
+                          </Pressable>
+                          {Platform.OS === "ios" && showMedicalEndDate ? (
+                            <DateTimePicker
+                              value={dateFromYmd(medicalCertificateEnd || medicalCertificateStart)}
+                              minimumDate={medicalCertificateStart ? dateFromYmd(medicalCertificateStart) : undefined}
+                              mode="date"
+                              display={Platform.OS === "ios" ? "compact" : "default"}
+                              onChange={(event: DateTimePickerEvent, selected?: Date) => {
+                                setShowMedicalEndDate(false);
+                                if (event.type === "dismissed" || !selected) return;
+                                setMedicalCertificateEnd(formatDateOnly(selected));
+                              }}
+                            />
+                          ) : null}
+                        </View>
+                      </View>
+                      <View style={styles.fieldDocActions}>
+                        <Pressable style={styles.btnPrimary} disabled={!!fieldDocumentBusy} onPress={() => uploadFieldDocument("certificadoMedico")}>
+                          {fieldDocumentBusy === "certificadoMedico" ? <ActivityIndicator color="#fff" /> : <Ionicons name="cloud-upload-outline" size={16} color="#fff" />}
+                          <Text style={styles.btnPrimaryText}>Cargar certificado</Text>
+                        </Pressable>
+                        {usuario?.documentosCampo?.certificadoMedico?.key ? (
+                          <Pressable style={styles.btnOutline} onPress={() => openFieldDocument("certificadoMedico")}>
+                            <Text style={styles.btnOutlineText}>Ver</Text>
+                          </Pressable>
+                        ) : null}
+                      </View>
+                    </View>
+
+                    {([
+                      { type: "cipu" as const, title: "CIPU", icon: "card-account-details-outline" as const },
+                      { type: "arl" as const, title: "ARL", icon: "shield-account-outline" as const },
+                    ]).map((item) => {
+                      const document = usuario?.documentosCampo?.[item.type];
+                      const cipuOperational =
+                        item.type !== "cipu" ||
+                        (certStatus.label !== "Vencido" && certStatus.label !== "—");
+                      return (
+                        <View key={item.type} style={styles.fieldDocCard}>
+                          <View style={styles.rowBetween}>
+                            <View style={styles.fieldDocHeading}>
+                              <MaterialCommunityIcons name={item.icon} size={20} color="#111918" />
+                              <View style={{ flex: 1 }}>
+                                <Text style={styles.fieldDocTitle}>{item.title}</Text>
+                                <Text style={styles.fieldDocMeta}>{document?.name || "Sin archivo"}</Text>
+                              </View>
+                            </View>
+                            <View style={[styles.missionRelationBadge, document?.key && cipuOperational ? styles.missionApprovalApproved : styles.missionApprovalPending]}>
+                              <Text style={styles.missionRelationText}>
+                                {!document?.key ? "Pendiente" : cipuOperational ? "Disponible" : "Médico vencido"}
+                              </Text>
+                            </View>
+                          </View>
+                          {item.type === "cipu" && document?.key && !cipuOperational ? (
+                            <Text style={styles.warningInline}>El CIPU no figura vigente para campo mientras el certificado médico esté vencido.</Text>
+                          ) : null}
+                          <View style={styles.fieldDocActions}>
+                            <Pressable style={styles.btnPrimary} disabled={!!fieldDocumentBusy} onPress={() => uploadFieldDocument(item.type)}>
+                              {fieldDocumentBusy === item.type ? <ActivityIndicator color="#fff" /> : <Ionicons name="cloud-upload-outline" size={16} color="#fff" />}
+                              <Text style={styles.btnPrimaryText}>Cargar {item.title}</Text>
+                            </Pressable>
+                            {document?.key ? (
+                              <Pressable style={styles.btnOutline} onPress={() => openFieldDocument(item.type)}>
+                                <Text style={styles.btnOutlineText}>Ver</Text>
+                              </Pressable>
+                            ) : null}
+                          </View>
+                        </View>
+                      );
+                    })}
+                  </View>
+
                   <View style={styles.card}>
                     <Text style={styles.cardTitle}>Carnet del piloto</Text>
                     <View style={styles.pilotIdCard}>
@@ -8565,7 +10172,7 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                     </View>
 
                     <Text style={styles.muted}>
-                      Última actualización: {weatherDetail.updatedAt ? formatDateOnly(weatherDetail.updatedAt) : "—"}
+                      Fuente: Open-Meteo · Observación: {formatWeatherObservation(weatherDetail.updatedAt)} · GPS de alta precisión
                     </Text>
                   </View>
                 </>
@@ -9760,7 +11367,27 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
               {/* MISIONES */}
 {section === "missions" && (
   <>
-    <Text style={styles.sectionTitle}>Misiones asignadas</Text>
+    <View style={[styles.rowBetween, { marginBottom: 12, alignItems: "center" }]}>
+      <View />
+      {canPlanFlyNorthMission ? (
+        <Pressable
+          style={[styles.btnPrimary, { minWidth: 150, justifyContent: "center" }]}
+          onPress={async () => {
+            const inMemoryToken = String(ctxToken || token || "").trim();
+            const activeToken = inMemoryToken || await getToken();
+            if (!activeToken) {
+              Toast.show({ type: "error", text1: "Sesión vencida", text2: "Inicia sesión nuevamente." });
+              return;
+            }
+            setMissionPlannerToken(activeToken);
+            setShowMissionPlanner(true);
+          }}
+        >
+          <Ionicons name="add-circle-outline" size={17} color="#ffffff" />
+          <Text style={styles.btnPrimaryText}>Nueva Operación</Text>
+        </Pressable>
+      ) : null}
+    </View>
 
     {loadingMisiones ? (
       <View style={styles.loadingBox}>
@@ -9784,6 +11411,16 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
     const adjuntos = Array.isArray((m as any)?.adjuntos) ? (m as any).adjuntos : [];
     const autorizacion = (m as any)?.autorizacionVuelo || null;
     const sugerida = m.aeronaveSugerida || equipoSel?.ruas || equipos[0]?.ruas || "Pendiente asignación";
+    const relationLabels = getMissionRelationLabels(m, usuario?._id);
+    const operationReady =
+      m.estadoAprobacion !== "pendiente" &&
+      m.estadoAprobacion !== "devuelta" &&
+      m.estadoAutorizacionVuelo !== "pendiente_gestion";
+    const chiefObserverCanApprove =
+      canApproveFlyNorthMission &&
+      Boolean(m.relacionUsuario?.soyObservador) &&
+      m.estadoAprobacion !== "aprobada" &&
+      (m.estadoAutorizacionVuelo === "no_requiere" || Boolean(autorizacion?.key));
 
     const tieneMapa = !!(m as any)?.areaOperacion || !!m.kmlUrl || !!m.kmzUrl;
 
@@ -9795,6 +11432,63 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
             <Text style={[styles.pillText, { color: prioridadeColor(prioridad) }]}>{prioridad}</Text>
           </View>
         </View>
+
+        {(relationLabels.length > 0 || m.esRepetitiva || m.estadoAprobacion === "pendiente" || m.estadoAprobacion === "aprobada") && (
+          <View style={styles.missionRelationRow}>
+            {m.esRepetitiva ? (
+              <View style={[styles.missionRelationBadge, styles.missionRelationRecurring]}>
+                <Text style={styles.missionRelationText}>Repetitiva diaria</Text>
+              </View>
+            ) : null}
+            {m.estadoAprobacion === "pendiente" ? (
+              <View style={[styles.missionRelationBadge, styles.missionApprovalPending]}>
+                <Text style={styles.missionRelationText}>Pendiente de aprobación</Text>
+              </View>
+            ) : null}
+            {m.estadoAprobacion === "aprobada" ? (
+              <View style={[styles.missionRelationBadge, styles.missionApprovalApproved]}>
+                <Text style={styles.missionRelationText}>Aprobada</Text>
+              </View>
+            ) : null}
+            {relationLabels.map((relation) => (
+              <View
+                key={relation.key}
+                style={[
+                  styles.missionRelationBadge,
+                  relation.tone === "created"
+                    ? styles.missionRelationCreated
+                    : relation.tone === "observer"
+                      ? styles.missionRelationObserver
+                      : styles.missionRelationAssigned,
+                ]}
+              >
+                <Text style={styles.missionRelationText}>{relation.text}</Text>
+              </View>
+            ))}
+          </View>
+        )}
+
+        {(m.estadoAutorizacionVuelo === "pendiente_gestion" || m.estadoAprobacion === "devuelta") && !autorizacion && (
+          <Pressable
+            style={[styles.btnOutline, { marginTop: 12, justifyContent: "center" }]}
+            onPress={() => uploadAuthorizationAndSubmit(m)}
+          >
+            <Ionicons name="cloud-upload-outline" size={17} color="#111918" />
+            <Text style={styles.btnOutlineText}>
+              {canApproveFlyNorthMission ? "Cargar autorización para revisar" : "Subir autorización y enviar"}
+            </Text>
+          </Pressable>
+        )}
+
+        {canApproveFlyNorthMission && (m.estadoAprobacion === "pendiente" || chiefObserverCanApprove) && (
+          <Pressable
+            style={[styles.btnPrimary, { marginTop: 10, justifyContent: "center" }]}
+            onPress={() => approveMissionAuthorization(m)}
+          >
+            <Ionicons name="shield-checkmark-outline" size={17} color="#ffffff" />
+            <Text style={styles.btnPrimaryText}>Autorizar operación</Text>
+          </Pressable>
+        )}
 
         <Text style={styles.missionText}>
           <Text style={styles.bold}>Título:</Text> {m.titulo || "—"}
@@ -9903,11 +11597,12 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
 
           {/* ✅ Cumplida */}
           <Pressable
-            style={[styles.btnPrimary, { flex: 1, minWidth: 140 }]}
+            style={[styles.btnPrimary, { flex: 1, minWidth: 140 }, !operationReady && styles.paginationBtnDisabled]}
             onPress={() => iniciarMision(m)}
+            disabled={!operationReady}
           >
             <Ionicons name="play" size={16} color="white" />
-            <Text style={styles.btnPrimaryText}>Iniciar misión</Text>
+            <Text style={styles.btnPrimaryText}>{operationReady ? "Iniciar misión" : "Esperando aprobación"}</Text>
           </Pressable>
 
           <Pressable
@@ -9951,6 +11646,7 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
         {misionesCumplidasPaginadas.map((m) => {
           const descripcion = (m.descripcion || m.instrucciones || m.titulo || "—").trim() || "—";
           const fechaCumplida = formatDateOnly((m as any).fechaOperacion || (m as any).fecha);
+          const relationLabels = getMissionRelationLabels(m, usuario?._id);
           return (
             <View key={m._id} style={[styles.missionCard, { opacity: 0.95 }]}>
               <View style={styles.rowBetween}>
@@ -9959,6 +11655,31 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                   <Text style={[styles.pillText, { color: "#0a5a22" }]}>Cumplida</Text>
                 </View>
               </View>
+
+              {(relationLabels.length > 0 || m.esRepetitiva) && (
+                <View style={styles.missionRelationRow}>
+                  {m.esRepetitiva ? (
+                    <View style={[styles.missionRelationBadge, styles.missionRelationRecurring]}>
+                      <Text style={styles.missionRelationText}>Repetitiva diaria</Text>
+                    </View>
+                  ) : null}
+                  {relationLabels.map((relation) => (
+                    <View
+                      key={relation.key}
+                      style={[
+                        styles.missionRelationBadge,
+                        relation.tone === "created"
+                          ? styles.missionRelationCreated
+                          : relation.tone === "observer"
+                            ? styles.missionRelationObserver
+                            : styles.missionRelationAssigned,
+                      ]}
+                    >
+                      <Text style={styles.missionRelationText}>{relation.text}</Text>
+                    </View>
+                  ))}
+                </View>
+              )}
 
               <Text style={styles.missionText}>
                 <Text style={styles.bold}>Descripción:</Text> {descripcion}
@@ -11265,11 +12986,13 @@ return disponibles.map((m) => {
               onPress={async () => {
                 closeKeyboard();
                 try {
-                  const picked = await DocumentPicker.getDocumentAsync({
-                    type: "*/*",
-                    copyToCacheDirectory: true,
-                    multiple: true,
-                  });
+                  const picked = DJIFlightLogSync.isAvailable
+                    ? await DJIFlightLogSync.pickLogs("DJI_PILOT_2")
+                    : await DocumentPicker.getDocumentAsync({
+                        type: "*/*",
+                        copyToCacheDirectory: true,
+                        multiple: true,
+                      });
 
                   if (picked.canceled) return;
 
@@ -11640,7 +13363,244 @@ return disponibles.map((m) => {
         </Pressable>
       </Modal>
 
-      <View style={[styles.bottomNavWrap, { bottom: Math.max(insets.bottom + 14, 26), paddingBottom: 9 }]}>
+      <Modal
+        visible={showBatteryForm}
+        animationType="fade"
+        transparent
+        statusBarTranslucent
+        presentationStyle="overFullScreen"
+        onRequestClose={() => !savingBattery && setShowBatteryForm(false)}
+      >
+        <Pressable style={styles.modalOverlay} onPress={closeKeyboard}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={styles.equipoFormKeyboard}>
+            <Pressable style={styles.equipoFormSheet} onPress={() => {}}>
+              <View style={styles.modalHeader}>
+                <View style={styles.equipoFormTitleRow}>
+                  <View style={styles.equipoFormHeaderIcon}>
+                    <Ionicons name="battery-charging-outline" size={22} color="#111918" />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.modalTitle}>Registrar batería</Text>
+                    <Text style={styles.notificationSubtitle}>Asociada al UAS seleccionado</Text>
+                  </View>
+                </View>
+                <Pressable style={styles.notificationClose} onPress={() => !savingBattery && setShowBatteryForm(false)}>
+                  <Ionicons name="close" size={22} color="#111918" />
+                </Pressable>
+              </View>
+              <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingVertical: 14, paddingBottom: 25 }}>
+                {([
+                  ["nombre", "Nombre", "Ej: Batería 01"],
+                  ["marca", "Marca", "Ej: DJI"],
+                  ["modelo", "Modelo", "Modelo de batería"],
+                  ["serial", "Serial *", "Serial único"],
+                  ["ciclos", "Ciclos actuales", "0"],
+                  ["maxCiclos", "Máximo de ciclos", "200"],
+                  ["notas", "Notas", "Observaciones"],
+                ] as const).map(([field, label, placeholder]) => (
+                  <View key={field} style={{ marginBottom: 11 }}>
+                    <Text style={styles.kLabel}>{label}</Text>
+                    <TextInput
+                      style={[styles.input, { marginTop: 6 }]}
+                      value={batteryForm[field]}
+                      onChangeText={(value) => setBatteryForm((prev) => ({ ...prev, [field]: value }))}
+                      placeholder={placeholder}
+                      placeholderTextColor="#8c9aaa"
+                      keyboardType={field === "ciclos" || field === "maxCiclos" ? "number-pad" : "default"}
+                      multiline={field === "notas"}
+                    />
+                  </View>
+                ))}
+                <Text style={styles.kLabel}>Fecha de adquisición</Text>
+                <Pressable
+                  style={[styles.input, styles.datePressable, { marginTop: 6 }]}
+                  onPress={() => DateTimePickerAndroid.open({
+                    value: batteryForm.fechaAdquisicion ? dateFromYmd(batteryForm.fechaAdquisicion) : new Date(),
+                    mode: "date",
+                    onChange: (event, date) => {
+                      if (event.type !== "dismissed" && date) {
+                        setBatteryForm((prev) => ({ ...prev, fechaAdquisicion: formatDateOnly(date) }));
+                      }
+                    },
+                  })}
+                >
+                  <Text style={{ color: batteryForm.fechaAdquisicion ? "#1b2b3a" : "#8c9aaa", flex: 1 }}>
+                    {batteryForm.fechaAdquisicion || "Seleccionar fecha"}
+                  </Text>
+                  <Ionicons name="calendar-outline" size={18} color="#111918" />
+                </Pressable>
+                <View style={{ flexDirection: "row", marginTop: 18 }}>
+                  <Pressable style={[styles.btnOutline, { flex: 1, justifyContent: "center", marginRight: 9 }]} onPress={() => setShowBatteryForm(false)}>
+                    <Text style={styles.btnOutlineText}>Cancelar</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.btnPrimary, { flex: 1, justifyContent: "center", opacity: savingBattery ? 0.65 : 1 }]}
+                    disabled={savingBattery}
+                    onPress={saveBattery}
+                  >
+                    {savingBattery ? <ActivityIndicator color="#fff" /> : <Ionicons name="save-outline" size={18} color="#fff" />}
+                    <Text style={styles.btnPrimaryText}>Guardar batería</Text>
+                  </Pressable>
+                </View>
+              </ScrollView>
+            </Pressable>
+          </KeyboardAvoidingView>
+        </Pressable>
+      </Modal>
+
+      <Modal
+        visible={showEquipoForm}
+        animationType="fade"
+        transparent
+        statusBarTranslucent
+        presentationStyle="overFullScreen"
+        onRequestClose={() => !savingEquipo && setShowEquipoForm(false)}
+      >
+        <Pressable style={styles.modalOverlay} onPress={closeKeyboard}>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : undefined} style={styles.equipoFormKeyboard}>
+            <Pressable style={styles.equipoFormSheet} onPress={() => {}}>
+                <View style={styles.modalHeader}>
+                  <View style={styles.equipoFormTitleRow}>
+                    <View style={styles.equipoFormHeaderIcon}>
+                      <MaterialCommunityIcons name="drone" size={22} color="#111918" />
+                    </View>
+                    <View style={{ flex: 1 }}>
+                    <Text style={styles.modalTitle}>{editingEquipoId ? "Editar UAS" : "Nuevo UAS"}</Text>
+                    <Text style={styles.notificationSubtitle}>Información técnica y estado operacional</Text>
+                    </View>
+                  </View>
+                  <Pressable style={styles.notificationClose} onPress={() => !savingEquipo && setShowEquipoForm(false)}>
+                    <Ionicons name="close" size={22} color="#111918" />
+                  </Pressable>
+                </View>
+
+                <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false} contentContainerStyle={{ paddingVertical: 14, paddingBottom: 26 }}>
+                  {([
+                    ["ruas", "Número RUAS *", "Ej: RUAS-001"],
+                    ["serie", "Número de serie *", "Serial del fabricante"],
+                    ["modelo", "Modelo *", "Ej: DJI Matrice 350 RTK"],
+                    ["horasVuelo", "Horas de vuelo", "0"],
+                    ["manualUsuarioLink", "Enlace manual de usuario", "https://..."],
+                  ] as const).map(([field, label, placeholder]) => (
+                    <View key={field} style={{ marginBottom: 12 }}>
+                      <Text style={styles.kLabel}>{label}</Text>
+                      <TextInput
+                        style={[styles.input, { marginTop: 6 }]}
+                        value={equipoForm[field]}
+                        onChangeText={(value) => setEquipoForm((prev) => ({ ...prev, [field]: value }))}
+                        placeholder={placeholder}
+                        placeholderTextColor="#8c9aaa"
+                        keyboardType={field === "horasVuelo" ? "decimal-pad" : "default"}
+                        autoCapitalize={field === "manualUsuarioLink" ? "none" : "sentences"}
+                      />
+                    </View>
+                  ))}
+
+                  <Text style={styles.kLabel}>Estado operacional</Text>
+                  <View style={{ flexDirection: "row", flexWrap: "wrap", marginTop: 7, marginBottom: 12 }}>
+                    {["Aeronavegable", "No Aeronavegable", "Fuera de servicio", "Arrendado", "Vendido"].map((estado) => (
+                      <Pressable
+                        key={estado}
+                        style={[styles.chip, { marginRight: 7, marginBottom: 7 }, equipoForm.estado === estado && styles.chipActive]}
+                        onPress={() => setEquipoForm((prev) => ({ ...prev, estado, arrendado: estado === "Arrendado" }))}
+                      >
+                        <Text style={[styles.chipText, equipoForm.estado === estado && styles.chipTextActive]}>{estado}</Text>
+                      </Pressable>
+                    ))}
+                  </View>
+
+                  {([
+                    ["polizaVigencia", "Inicio de vigencia de póliza"],
+                    ["polizaVence", "Vencimiento de póliza"],
+                    ...(equipoForm.arrendado
+                      ? [
+                          ["fechaInicioArrendamiento", "Inicio del arrendamiento"],
+                          ["fechaFinArrendamiento", "Fin del arrendamiento"],
+                        ]
+                      : []),
+                  ] as Array<[keyof typeof equipoForm, string]>).map(([field, label]) => (
+                    <View key={field} style={{ marginBottom: 12 }}>
+                      <Text style={styles.kLabel}>{label}</Text>
+                      <Pressable
+                        style={[styles.input, { marginTop: 6, flexDirection: "row", alignItems: "center", justifyContent: "space-between" }]}
+                        onPress={() => openEquipoDatePicker(field as any)}
+                      >
+                        <Text style={{ color: equipoForm[field] ? "#1b2b3a" : "#8c9aaa", fontFamily: FONT.regular }}>
+                          {String(equipoForm[field] || "Seleccionar fecha")}
+                        </Text>
+                        <Ionicons name="calendar-outline" size={19} color="#0b5d8b" />
+                      </Pressable>
+                    </View>
+                  ))}
+
+                  <Text style={[styles.kLabel, { marginTop: 3, marginBottom: 7 }]}>Archivos del UAS</Text>
+                  {([
+                    ["foto", "Fotografía", "image-outline"],
+                    ["polizaPdf", "Póliza PDF", "shield-check-outline"],
+                    ["ruasPdf", "Certificado RUAS PDF", "file-certificate-outline"],
+                  ] as const).map(([field, label, icon]) => (
+                    <Pressable
+                      key={field}
+                      style={[styles.btnOutline, { marginBottom: 8, justifyContent: "flex-start" }]}
+                      onPress={() => pickEquipoFile(field)}
+                    >
+                      <MaterialCommunityIcons name={icon} size={18} color="#0b5d8b" />
+                      <Text style={[styles.btnOutlineText, { flex: 1 }]} numberOfLines={1}>
+                        {equipoFiles[field]?.name || label}
+                      </Text>
+                      <Ionicons name={equipoFiles[field] ? "checkmark-circle" : "attach-outline"} size={18} color={equipoFiles[field] ? "#16a34a" : "#708596"} />
+                    </Pressable>
+                  ))}
+
+                  <View style={{ flexDirection: "row", marginTop: 8 }}>
+                    <Pressable
+                      style={[styles.btnOutline, { flex: 1, justifyContent: "center", marginRight: 9 }]}
+                      disabled={savingEquipo}
+                      onPress={() => setShowEquipoForm(false)}
+                    >
+                      <Text style={styles.btnOutlineText}>Cancelar</Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.btnPrimary, { flex: 1, justifyContent: "center", opacity: savingEquipo ? 0.65 : 1 }]}
+                      disabled={savingEquipo}
+                      onPress={saveEquipo}
+                    >
+                      {savingEquipo ? <ActivityIndicator color="#fff" /> : <Ionicons name="save-outline" size={18} color="#fff" />}
+                      <Text style={styles.btnPrimaryText}>{savingEquipo ? "Guardando..." : "Guardar UAS"}</Text>
+                    </Pressable>
+                  </View>
+                </ScrollView>
+            </Pressable>
+          </KeyboardAvoidingView>
+        </Pressable>
+      </Modal>
+
+      <Modal
+        visible={showMissionPlanner}
+        animationType="fade"
+        transparent
+        statusBarTranslucent
+        presentationStyle="overFullScreen"
+        onRequestClose={closeMissionPlanner}
+      >
+        <View style={styles.sheetOverlay}>
+          <Pressable style={StyleSheet.absoluteFill} onPress={closeKeyboard} />
+          <View style={styles.missionPlannerSheetWrap}>
+            <View style={styles.modalWrap}>
+              <View style={styles.missionPlannerSheet}>
+                <MissionPlannerScreen
+                  token={missionPlannerToken || String(ctxToken || token || "")}
+                  onClose={closeMissionPlanner}
+                  onCreated={handleMissionPlannerCreated}
+                />
+              </View>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {!alfabotKbVisible && (
+      <View style={[styles.bottomNavWrap, { bottom: Math.max(insets.bottom + 4, 10), paddingBottom: 9 }]}>
         <ScrollView
           horizontal
           showsHorizontalScrollIndicator={false}
@@ -11669,9 +13629,25 @@ return disponibles.map((m) => {
           }}
         >
           <NavItem icon="chart-bar" label="Inicio" active={section === "dashboard"} onPress={() => goSection("dashboard")} />
+          {isChiefPilotRole ? (
+            <NavItem
+              icon="briefcase-outline"
+              label="Gestión"
+              active={section === "chief-management"}
+              onPress={() => goSection("chief-management")}
+            />
+          ) : null}
           <NavItem icon="airplane" label="Bitácora" active={section === "flight-log"} onPress={() => goSection("flight-log")} />
           <NavItem icon="map-marker-path" label="Misiones" active={section === "missions"} onPress={() => goSection("missions")} dot={misionesPendientes > 0} />
-          <NavItem icon="drone" label="Equipos UAS" active={section === "equipos-uas"} onPress={() => goSection("equipos-uas")} />
+          <NavItem
+            icon="drone"
+            label="Equipos UAS"
+            active={section === "equipos-uas"}
+            onPress={() => {
+              setEquiposViewMode("fleet");
+              goSection("equipos-uas");
+            }}
+          />
           <NavItem icon="file-document-outline" label="Proced." active={section === "procedures"} onPress={openProceduresAll} />
           <NavItem
             icon="clipboard-list-outline"
@@ -11699,6 +13675,7 @@ return disponibles.map((m) => {
           </View>
         ) : null}
       </View>
+      )}
 
       <Animated.View
         style={[
@@ -11816,6 +13793,8 @@ return disponibles.map((m) => {
         </View>
       </Modal>
 
+
+      </KeyboardAvoidingView>
 
       </View>
     </>
@@ -12034,10 +14013,35 @@ function escapeHtml(text: string) {
 function buildDashboardMapHtml(params: {
   center: LatLng;
   markerLabel: string;
+  weather?: {
+    ok: boolean;
+    label: string;
+    tempC?: number | null;
+    windMs?: number | null;
+    precipProbPct?: number | null;
+    flightState: WeatherFlightState;
+  };
   centerTick?: number;
 }) {
-  const { center, markerLabel, centerTick = 0 } = params;
+  const { center, markerLabel, weather, centerTick = 0 } = params;
   const safeMarkerLabel = escapeHtml(markerLabel);
+  const safeWeatherLabel = escapeHtml(weather?.ok ? weather.label : "Actualizando clima");
+  const temperatureLabel = weather?.tempC != null ? `${weather.tempC.toFixed(1)}°C` : "—";
+  const windLabel = weather?.windMs != null ? `${weather.windMs.toFixed(1)} m/s` : "—";
+  const rainLabel = weather?.precipProbPct != null ? `${Math.round(weather.precipProbPct)}%` : "—";
+  const flightLabel =
+    weather?.flightState === "APTAS"
+      ? "Condiciones aptas"
+      : weather?.flightState === "NO_RECOMENDADAS"
+        ? "No recomendadas"
+        : "Condiciones marginales";
+  const flightColor =
+    weather?.flightState === "APTAS"
+      ? "#15803d"
+      : weather?.flightState === "NO_RECOMENDADAS"
+        ? "#b91c1c"
+        : "#b45309";
+  const safeFlightLabel = escapeHtml(flightLabel);
 
   return `
   <!DOCTYPE html>
@@ -12047,7 +14051,28 @@ function buildDashboardMapHtml(params: {
     <style>
       html, body, #map { height: 100%; margin: 0; padding: 0; background: #f4f6fa; }
       body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-      .leaflet-control-attribution { display: none; }
+      .leaflet-control-attribution {
+        padding: 2px 5px !important;
+        border-radius: 7px 0 0 0;
+        background: rgba(255,255,255,.78) !important;
+        font-size: 8px !important;
+      }
+      .weather-tooltip {
+        min-width: 188px;
+        padding: 0 !important;
+        overflow: hidden;
+        border: 0 !important;
+        border-radius: 16px !important;
+        background: rgba(255,255,255,.97) !important;
+        box-shadow: 0 12px 30px rgba(15,23,42,.24) !important;
+      }
+      .weather-tooltip:before { display: none !important; }
+      .weather-card { padding: 11px 12px 10px; color: #102a43; }
+      .weather-title { font-size: 13px; line-height: 17px; font-weight: 800; }
+      .weather-state { margin-top: 2px; font-size: 10px; font-weight: 700; color: ${flightColor}; }
+      .weather-grid { display: flex; gap: 12px; margin-top: 8px; }
+      .weather-value { font-size: 12px; font-weight: 800; color: #111918; white-space: nowrap; }
+      .weather-label { margin-top: 1px; font-size: 8px; font-weight: 700; color: #718096; text-transform: uppercase; }
     </style>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   </head>
@@ -12059,8 +14084,14 @@ function buildDashboardMapHtml(params: {
       const centerTick = ${JSON.stringify(centerTick)};
       const map = L.map("map", { zoomControl: false, dragging: true, scrollWheelZoom: false });
 
-      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        maxZoom: 19
+      L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", {
+        maxZoom: 20,
+        attribution: "Tiles &copy; Esri"
+      }).addTo(map);
+
+      L.tileLayer("https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}", {
+        maxZoom: 20,
+        attribution: "Labels &copy; Esri"
       }).addTo(map);
 
       const liveIcon = L.divIcon({
@@ -12072,6 +14103,18 @@ function buildDashboardMapHtml(params: {
 
       const marker = L.marker(center, { icon: liveIcon }).addTo(map);
       marker.bindPopup("${safeMarkerLabel}");
+      marker.bindTooltip(
+        '<div class="weather-card">' +
+          '<div class="weather-title">${safeWeatherLabel}</div>' +
+          '<div class="weather-state">${safeFlightLabel}</div>' +
+          '<div class="weather-grid">' +
+            '<div><div class="weather-value">${temperatureLabel}</div><div class="weather-label">Temperatura</div></div>' +
+            '<div><div class="weather-value">${windLabel}</div><div class="weather-label">Viento</div></div>' +
+            '<div><div class="weather-value">${rainLabel}</div><div class="weather-label">Lluvia</div></div>' +
+          '</div>' +
+        '</div>',
+        { permanent: true, direction: "top", offset: [0, -16], className: "weather-tooltip", opacity: 1 }
+      ).openTooltip();
       map.setView(center, 15);
       window.__mapCenterTick = centerTick;
     </script>
@@ -12204,6 +14247,62 @@ function getCertStatus(fecha?: string | Date) {
 }
 
 const styles = StyleSheet.create({
+  screenBroadcastCard: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 13,
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "#cfe1ec",
+    borderRadius: 18,
+    padding: 16,
+    marginTop: 14,
+    shadowColor: "#0b4164",
+    shadowOpacity: 0.07,
+    shadowRadius: 12,
+    shadowOffset: { width: 0, height: 5 },
+    elevation: 2,
+  },
+  screenBroadcastIcon: {
+    width: 50,
+    height: 50,
+    borderRadius: 15,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#0799c1",
+  },
+  screenBroadcastTitle: {
+    fontFamily: "Nunito_800ExtraBold",
+    color: "#062d50",
+    fontSize: 17,
+  },
+  screenBroadcastText: {
+    fontFamily: "Nunito_400Regular",
+    color: "#687b8e",
+    fontSize: 13,
+    marginTop: 2,
+  },
+  missionPlannerSheetWrap: {
+    flex: 1,
+    width: "100%",
+    justifyContent: "flex-end",
+  },
+  missionPlannerSheet: {
+    flex: 1,
+    maxHeight: "92%",
+    width: "100%",
+    maxWidth: 760,
+    alignSelf: "center",
+    overflow: "hidden",
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    backgroundColor: "#f6f7f8",
+    shadowColor: "#020817",
+    shadowOpacity: 0.28,
+    shadowRadius: 24,
+    shadowOffset: { width: 0, height: 12 },
+    elevation: 14,
+  },
   screen: { flex: 1, backgroundColor: "#ffffff" },
 
   row: { flexDirection: "row", alignItems: "center" },
@@ -12270,6 +14369,15 @@ const styles = StyleSheet.create({
     elevation: 5,
   },
   bannerImg: { width: "100%", height: "100%" },
+  flyNorthBannerCard: {
+    backgroundColor: "#ffffff",
+    borderColor: "rgba(255,255,255,0.45)",
+  },
+  flyNorthBannerImg: {
+    width: "92%",
+    height: "92%",
+    alignSelf: "center",
+  },
   bannerOverlay: {
     position: "absolute",
     left: 0,
@@ -12753,6 +14861,109 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: "center",
     justifyContent: "center",
+  },
+  notificationBadge: {
+    position: "absolute",
+    top: -5,
+    right: -5,
+    minWidth: 19,
+    height: 19,
+    paddingHorizontal: 4,
+    borderRadius: 10,
+    backgroundColor: "#ef4444",
+    borderWidth: 2,
+    borderColor: "#070b0d",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  notificationBadgeText: {
+    color: "#ffffff",
+    fontSize: 9,
+    lineHeight: 11,
+    fontFamily: FONT.extra,
+  },
+  notificationOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(3, 9, 14, 0.54)",
+    justifyContent: "flex-start",
+    paddingHorizontal: 14,
+    paddingTop: 88,
+  },
+  notificationSheet: {
+    alignSelf: "flex-end",
+    width: "100%",
+    maxWidth: 430,
+    maxHeight: "72%",
+    borderRadius: 22,
+    backgroundColor: "#ffffff",
+    padding: 16,
+    shadowColor: "#000000",
+    shadowOpacity: 0.2,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 9 },
+    elevation: 10,
+  },
+  notificationSubtitle: {
+    marginTop: 2,
+    color: "#64748b",
+    fontSize: 12,
+    fontFamily: FONT.regular,
+  },
+  notificationClose: {
+    width: 36,
+    height: 36,
+    borderRadius: 12,
+    backgroundColor: "#f1f5f9",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  notificationRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    paddingVertical: 12,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: "#dbe4ec",
+  },
+  notificationIcon: {
+    width: 39,
+    height: 39,
+    borderRadius: 13,
+    marginRight: 11,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  notificationIconDanger: { backgroundColor: "#dc2626" },
+  notificationIconWarning: { backgroundColor: "#d97706" },
+  notificationIconInfo: { backgroundColor: "#0b5d8b" },
+  notificationTitle: {
+    color: "#111918",
+    fontSize: 14,
+    fontFamily: FONT.semi,
+  },
+  notificationDetail: {
+    marginTop: 3,
+    color: "#64748b",
+    fontSize: 12,
+    lineHeight: 17,
+    fontFamily: FONT.regular,
+  },
+  notificationEmpty: {
+    alignItems: "center",
+    paddingVertical: 32,
+    paddingHorizontal: 18,
+  },
+  notificationEmptyTitle: {
+    marginTop: 10,
+    color: "#1f2937",
+    fontSize: 15,
+    fontFamily: FONT.semi,
+  },
+  notificationEmptyText: {
+    marginTop: 4,
+    color: "#7a8b9a",
+    textAlign: "center",
+    fontSize: 12,
+    fontFamily: FONT.regular,
   },
   airMapTopLeft: {
     position: "absolute",
@@ -13566,6 +15777,21 @@ const styles = StyleSheet.create({
     elevation: 4,
   },
   missionId: { ...TEXT.body, fontFamily: FONT.semi, color: "#1b2b3a" },
+  missionRelationRow: { marginTop: 10, flexDirection: "row", flexWrap: "wrap", gap: 7 },
+  missionRelationBadge: { paddingHorizontal: 10, paddingVertical: 5, borderRadius: 999 },
+  missionRelationCreated: { backgroundColor: "#e0f2fe" },
+  missionRelationAssigned: { backgroundColor: "#dcfce7" },
+  missionRelationObserver: { backgroundColor: "#fef3c7" },
+  missionRelationRecurring: { backgroundColor: "#ede9fe" },
+  missionApprovalPending: { backgroundColor: "#ffedd5" },
+  missionApprovalApproved: { backgroundColor: "#d1fae5" },
+  missionRelationText: { ...TEXT.small, color: "#1f3449", fontFamily: FONT.semi },
+  fieldDocCard: { marginTop: 10, padding: 13, borderRadius: 16, backgroundColor: "#f8fafc", borderWidth: 1, borderColor: "#e2e8f0" },
+  fieldDocHeading: { flex: 1, flexDirection: "row", alignItems: "center", gap: 9 },
+  fieldDocTitle: { ...TEXT.body, color: "#1b2b3a", fontFamily: FONT.semi },
+  fieldDocMeta: { marginTop: 3, ...TEXT.small, color: "#6b7a8a", fontFamily: FONT.regular },
+  fieldDocActions: { marginTop: 11, flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  warningInline: { marginTop: 9, ...TEXT.small, color: "#9a5800", fontFamily: FONT.semi },
   missionText: { marginTop: 8, ...TEXT.body, color: "#1b2b3a" },
   bold: { fontFamily: FONT.semi },
   missionOpsGrid: {
@@ -13670,6 +15896,135 @@ const styles = StyleSheet.create({
   },
 
   modalOverlay: { flex: 1, backgroundColor: "rgba(0,0,0,0.35)", justifyContent: "flex-end" },
+  equipoFormKeyboard: {
+    width: "100%",
+    maxHeight: "94%",
+  },
+  equipoFormSheet: {
+    width: "100%",
+    maxHeight: "92%",
+    backgroundColor: "#ffffff",
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    paddingHorizontal: 16,
+    paddingTop: 14,
+    paddingBottom: 10,
+    shadowColor: "#000000",
+    shadowOpacity: 0.16,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: -5 },
+    elevation: 12,
+  },
+  equipoFormTitleRow: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    paddingRight: 10,
+  },
+  equipoFormHeaderIcon: {
+    width: 42,
+    height: 42,
+    borderRadius: 14,
+    marginRight: 11,
+    backgroundColor: "#f1f3f4",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  hoursControlBlock: {
+    marginTop: 12,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: "#e4e9ed",
+  },
+  hoursCurrent: {
+    color: "#1b2b3a",
+    fontSize: 12,
+    fontFamily: FONT.semi,
+  },
+  hoursSeries: {
+    color: "#7a668e",
+    fontSize: 11,
+    fontFamily: FONT.regular,
+  },
+  hoursStrong: {
+    color: "#111918",
+    fontFamily: FONT.bold,
+  },
+  hoursMetricValue: {
+    marginTop: 2,
+    color: "#17213a",
+    fontSize: 17,
+    fontFamily: FONT.bold,
+  },
+  hoursInputsRow: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    marginTop: 11,
+  },
+  hoursInputColumn: {
+    flex: 1,
+  },
+  uasOperationalDetails: {
+    marginTop: 12,
+    paddingTop: 11,
+    borderTopWidth: 1,
+    borderTopColor: "#e4e9ed",
+  },
+  uasValidityText: {
+    marginTop: 8,
+    color: "#7a668e",
+    fontSize: 10.5,
+    fontFamily: FONT.regular,
+  },
+  uasActionStack: {
+    marginTop: 8,
+  },
+  uasWideAction: {
+    minHeight: 38,
+    alignSelf: "flex-start",
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 12,
+    marginBottom: 7,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#d7e2ed",
+    backgroundColor: "#ffffff",
+  },
+  uasWideActionText: {
+    marginLeft: 7,
+    color: "#102a43",
+    fontSize: 11,
+    fontFamily: FONT.bold,
+  },
+  hoursStatusBadge: {
+    maxWidth: "55%",
+    paddingHorizontal: 9,
+    paddingVertical: 5,
+    borderRadius: 999,
+  },
+  hoursStatusText: {
+    fontSize: 9.5,
+    fontFamily: FONT.bold,
+  },
+  hoursProgressTrack: {
+    height: 7,
+    marginTop: 11,
+    borderRadius: 999,
+    backgroundColor: "#e5e9ed",
+    overflow: "hidden",
+  },
+  hoursProgressFill: {
+    height: "100%",
+    borderRadius: 999,
+  },
+  hoursProgressCaption: {
+    marginTop: 4,
+    color: "#718096",
+    fontSize: 9.5,
+    textAlign: "right",
+    fontFamily: FONT.regular,
+  },
 modalCard: {
   backgroundColor: "white",
   borderRadius: 24,
