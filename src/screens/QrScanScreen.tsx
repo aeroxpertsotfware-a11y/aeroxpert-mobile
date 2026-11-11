@@ -9,6 +9,7 @@ import { StatusBar } from "expo-status-bar";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import NetInfo from "@react-native-community/netinfo";
+import { isNetInfoStateOnline } from "../offline/net";
 import { enqueueOfflineAction } from "../offline/fieldSync";
 
 const SECURE_TOKEN_KEY = "uas_token_v1";
@@ -77,7 +78,7 @@ export default function QrScanScreen({ navigation, route }: Props) {
         // ✅ usa el endpoint directo
         let bateria: any;
         const net = await NetInfo.fetch();
-        const online = !!net.isConnected && !!net.isInternetReachable;
+        const online = isNetInfoStateOnline(net);
         try {
           if (!online) throw new Error("offline");
           bateria = await apiGet<any>(`/baterias/by-token/${tokenQR}`, auth);

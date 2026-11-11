@@ -35,6 +35,7 @@ import * as SecureStore from "expo-secure-store";
 import DateTimePicker, { DateTimePickerAndroid, DateTimePickerEvent } from "@react-native-community/datetimepicker";
 import * as Speech from "expo-speech";
 import type { NativeStackNavigationProp } from "@react-navigation/native-stack";
+import MapView, { Circle as MapCircle, Marker, Polygon as MapPolygon, PROVIDER_GOOGLE } from "react-native-maps";
 import { WebView } from "react-native-webview";
 import * as Notifications from "expo-notifications";
 import * as Device from "expo-device";
@@ -45,6 +46,7 @@ import { apiPost as apiPostReq } from "../config/api";
 import Toast from "react-native-toast-message";
 import { useAuth } from "../context/AuthContext";
 import NetInfo from "@react-native-community/netinfo";
+import { isNetInfoStateOnline } from "../offline/net";
 import {
   enqueueOfflineAction,
   getOfflineActions,
@@ -77,6 +79,7 @@ import {
   getDJIDirectSyncSettings,
   getDJIDirectSyncSnapshot,
   getPendingDJIFlightLogs,
+  markDJIFlightLogsKnown,
   markDJIFlightLogsUploaded,
   saveDJIDirectSyncSettings,
 } from "../services/djiFlightLogSync";
@@ -122,6 +125,7 @@ type WeatherState = {
 type WeatherFlightState = "APTAS" | "MARGINALES" | "NO_RECOMENDADAS";
 
 type WeatherDetailState = WeatherState & {
+  provider?: string;
   windDirDeg?: number | null;
   windDirLabel?: string;
   windGustMs?: number | null;
@@ -140,6 +144,32 @@ type WeatherDetailState = WeatherState & {
   reasons: string[];
   updatedAt?: string | null;
 };
+
+const IS_DJI_RC_PLUS =
+  Platform.OS === "android" &&
+  `${Device.manufacturer || ""} ${Device.modelName || ""}`.toLowerCase().includes("dji") &&
+  `${Device.modelName || ""}`.toLowerCase().includes("rc plus");
+
+function buildRcDashboardMapHtml(
+  center: { latitude: number; longitude: number },
+  label: string,
+  mapType: "standard" | "hybrid"
+): string {
+  const safeCenter = JSON.stringify([center.latitude, center.longitude]);
+  const safeLabel = JSON.stringify(label || "Ubicación actual");
+  const tiles = mapType === "hybrid"
+    ? "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+    : "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png";
+  const attribution = mapType === "hybrid" ? "Tiles © Esri" : "© OpenStreetMap";
+  return `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>html,body,#map{width:100%;height:100%;margin:0;background:#dce5eb}.leaflet-control-attribution{font:8px sans-serif}</style></head>
+  <body><div id="map"></div><script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script><script>
+  const center=${safeCenter};const map=L.map('map',{zoomControl:false}).setView(center,16);
+  L.tileLayer(${JSON.stringify(tiles)},{maxZoom:20,attribution:${JSON.stringify(attribution)}}).addTo(map);
+  L.circleMarker(center,{radius:9,color:'#fff',weight:3,fillColor:'#14b8ff',fillOpacity:1}).addTo(map).bindPopup(${safeLabel});
+  </script></body></html>`;
+}
 
 type WeatherHourItem = {
   key: string;
@@ -192,6 +222,8 @@ type Usuario = {
   rol?: string;
   roles?: string[];
   email?: string;
+  qrPublicUrl?: string;
+  qrPublicToken?: string;
   empresaId?: string;
   rolActivo?: string;
   fechaCertificadoInicio?: string;
@@ -523,6 +555,12 @@ type Mision = {
   vientoMax?: number;
   estado: string;
   areaOperacion?: any | null; // acá viene el polígono/geojson
+  dronpuerto?: {
+    drp?: { latitude?: number; longitude?: number };
+    medidas?: { d?: number; tlof?: number; fato?: number; seguridad?: number; operacion?: number; espectadores?: number };
+    apto?: boolean; clearanceM?: number; modelo?: string; ruas?: string; fuente?: string;
+  } | null;
+  dronpuertoConfirmacion?: { confirmado?: boolean; confirmadoAt?: string; pilotoId?: string; ubicacionPiloto?: any } | null;
   pilotosAsignados?: any[];   // si lo populaste
   creadoPor?: any;
   observadorId?: any;
@@ -642,6 +680,8 @@ const filtrarEquiposVisiblesParaPiloto = (rows: any[]): EquipoUAS[] =>
 type NuevoReportePayload = {
   tipoCode: string;
   tipoLabel: string;
+  spiCode?: string;
+  spiLabel?: string;
   tipoSituacion?: string;
   esAnonimo?: boolean;
   evidencias?: Array<{ nombre: string; mime: string; uri: string }>;
@@ -773,9 +813,11 @@ const SECURE_VUELOS_QUEUE_KEY = "uas_vuelos_queue_v1";
 const SECURE_MISION_CUMPLIDA_QUEUE_KEY = "uas_mision_cumplida_queue_v1";
 const SECURE_REPORTE_DRAFT_KEY = "uas_reporte_draft_v1";
 const SECURE_FRAT_KEY = "uas_frat_v1";
-const PAGE_SIZE_REPORTES = 6;
-const PAGE_SIZE_BITACORA = 6;
+const PAGE_SIZE_REPORTES = 4;
+const PAGE_SIZE_BITACORA = 4;
 const PAGE_SIZE_MISIONES = 4;
+const PAGE_SIZE_EQUIPOS = 4;
+const PAGE_SIZE_PROCEDIMIENTOS = 4;
 
 function normalizeMissionStatus(value: unknown): string {
   return String(value || "")
@@ -794,9 +836,9 @@ function isMissionVisiblePendingStatus(value: unknown): boolean {
   return !isMissionCompletedStatus(value);
 }
 const PILOT_CARD_HEADER_LOGO = require("../../assets/avatar.png");
-const PILOT_PANEL_BANNER_LOGO = require("../../assets/logo-inicio.png");
+const PILOT_PANEL_BANNER_LOGO = require("../../assets/Xgou.png");
 const FLYNORTH_BANNER_LOGO = require("../../assets/flynorth-empresa.png");
-const ALFABOT_BOT_IMG = require("../../assets/AlfaBot.jpg");
+const ALFABOT_BOT_IMG = require("../../assets/ChatbotIA.webp");
 
 
 type ProcKind = "preflight" | "autoeval" | "battery";
@@ -1202,6 +1244,8 @@ type PendingReporte = {
     fecha: string;
     tipoCode: string;
     tipoLabel: string;
+    spiCode?: string;
+    spiLabel?: string;
     tipoSituacion?: string;
     esAnonimo?: boolean;
     evidencias?: Array<{ nombre: string; mime: string; uri: string }>;
@@ -1412,6 +1456,18 @@ async function apiFetch<T>(
   return (data ?? ({} as any)) as T;
 }
 
+async function showDataFallbackNotice(error: unknown, offlineMessage: string) {
+  const state = await NetInfo.fetch().catch(() => null);
+  const offline = state ? !isNetInfoStateOnline(state) : false;
+  const detail = error instanceof Error ? error.message : "No se pudo consultar el servidor.";
+
+  Toast.show({
+    type: offline ? "info" : "error",
+    text1: offline ? "Modo offline" : "Problema con el servidor",
+    text2: offline ? offlineMessage : detail,
+  });
+}
+
 
 async function getLocalProcStatusForMission(misionId: string) {
   const [q, fieldQueue] = await Promise.all([
@@ -1432,6 +1488,34 @@ async function getLocalProcStatusForMission(misionId: string) {
 }
 
 type ProcStatus = { preflight: boolean; autoeval: boolean; battery: boolean };
+
+type CompanyChecklistItem = {
+  codigo: string;
+  texto: string;
+  orden: number;
+  obligatorio: boolean;
+};
+
+type CompanyChecklistTemplate = {
+  _id: string;
+  codigo: string;
+  titulo: string;
+  descripcion?: string;
+  orden: number;
+  version: number;
+  vozHabilitada: boolean;
+  items: CompanyChecklistItem[];
+};
+
+type CompanyChecklistSubmission = {
+  _id?: string;
+  templateId: string;
+  templateCodigo: string;
+  estado: "completada" | "con_novedades";
+  fecha?: string;
+  respuestas?: Array<{ itemCodigo: string; texto: string; respuesta: boolean }>;
+  observaciones?: string;
+};
 
 async function canMarkMissionDone(
   misionId: string,
@@ -1721,6 +1805,11 @@ export default function PilotPanel({
   onLogout,
 }: PilotPanelProps) {
   const { logout, token: ctxToken } = useAuth();
+  const [usuario, setUsuario] = useState<Usuario | null>(initialUser);
+  const firstName = useMemo(() => {
+    const name = usuario?.nombre?.trim() || "Piloto";
+    return name.split(/\s+/)[0] || "Piloto";
+  }, [usuario?.nombre]);
 
   const [showEvidenceModal, setShowEvidenceModal] = useState(false);
   const [evidenceMissionId, setEvidenceMissionId] = useState<string>("");
@@ -1755,12 +1844,6 @@ export default function PilotPanel({
   const [savingFlight, setSavingFlight] = useState(false);
   const [showFlightDetailModal, setShowFlightDetailModal] = useState(false);
   const [selectedVuelo, setSelectedVuelo] = useState<VueloUI | null>(null);
-  const [flightFilterDate, setFlightFilterDate] = useState("");
-  const [flightFilterUas, setFlightFilterUas] = useState("");
-  const [flightFilterMission, setFlightFilterMission] = useState("");
-  const [showFlightFilterDate, setShowFlightFilterDate] = useState(false);
-  const [showFlightFilterUasModal, setShowFlightFilterUasModal] = useState(false);
-  const [showFlightFilterMissionModal, setShowFlightFilterMissionModal] = useState(false);
   const [reportesPage, setReportesPage] = useState(1);
   const [bitacoraPage, setBitacoraPage] = useState(1);
   const [bitacoraSolicitudes, setBitacoraSolicitudes] = useState<any[]>([]);
@@ -1768,6 +1851,9 @@ export default function PilotPanel({
   const [bitacoraSolicitando, setBitacoraSolicitando] = useState(false);
   const [misionesProgramadasPage, setMisionesProgramadasPage] = useState(1);
   const [misionesCumplidasPage, setMisionesCumplidasPage] = useState(1);
+  const [equiposPage, setEquiposPage] = useState(1);
+  const [procedimientosPage, setProcedimientosPage] = useState(1);
+  const [expandedMissionId, setExpandedMissionId] = useState<string | null>(null);
 
   const [flightLogSourceApp, setFlightLogSourceApp] =
     useState<"DJI_FLY" | "DJI_PILOT_2" | "DJI_GO_4">("DJI_FLY");
@@ -1791,6 +1877,8 @@ export default function PilotPanel({
   const [djiDirectSyncUploads, setDjiDirectSyncUploads] = useState<DJIDirectSyncUploadEntry[]>([]);
   const [djiDirectSyncBusy, setDjiDirectSyncBusy] = useState(false);
   const [djiDirectSyncLastMessage, setDjiDirectSyncLastMessage] = useState<string | null>(null);
+  const [djiDirectSyncMissionId, setDjiDirectSyncMissionId] = useState("");
+  const [showDjiDirectSyncMissions, setShowDjiDirectSyncMissions] = useState(false);
 
 
   
@@ -1798,7 +1886,7 @@ export default function PilotPanel({
 
    useEffect(() => {
     const unsub = NetInfo.addEventListener((s) => {
-      const online = !!s.isConnected && !!s.isInternetReachable;
+      const online = isNetInfoStateOnline(s);
       setIsOnline(online);
       isOnlineRef.current = online;
     });
@@ -1834,7 +1922,7 @@ export default function PilotPanel({
       setAlfabotMessages([
         {
           role: "bot",
-          text: `Hola ${firstName || "Usuario"}, soy AlfaBot. Puedo ayudarte con operaciones UAS.`,
+          text: `Hola ${firstName || "Usuario"}, soy AlfaBot. Puedo ayudarte con preguntas generales, gestión operacional y RAC 100.`,
           at: new Date().toISOString(),
         },
       ]);
@@ -1894,7 +1982,6 @@ export default function PilotPanel({
   const [savingMaintenanceId, setSavingMaintenanceId] = useState("");
   const [showNavScrollHint, setShowNavScrollHint] = useState<boolean>(true);
 
-  const [usuario, setUsuario] = useState<Usuario | null>(initialUser);
   const [medicalCertificateStart, setMedicalCertificateStart] = useState("");
   const [medicalCertificateEnd, setMedicalCertificateEnd] = useState("");
   const [showMedicalStartDate, setShowMedicalStartDate] = useState(false);
@@ -1934,6 +2021,7 @@ export default function PilotPanel({
   const [loadingMisiones, setLoadingMisiones] = useState<boolean>(false);
   const [refreshing, setRefreshing] = useState(false);
   const [telemetry, setTelemetry] = useState<any>(null);
+  const djiTelemetryPushRef = React.useRef({ lastSentAt: 0, inFlight: false });
   const [djiStatus, setDjiStatus] = useState<any>(null);
   const [djiActionBusy, setDjiActionBusy] = useState(false);
   const [gpsCell, setGpsCell] = useState<GpsCellState>({
@@ -1951,6 +2039,7 @@ export default function PilotPanel({
   const [weatherDetail, setWeatherDetail] = useState<WeatherDetailState>({
     ok: false,
     label: "Sin dato",
+    provider: "",
     tempC: null,
     windMs: null,
     windDirDeg: null,
@@ -1973,6 +2062,7 @@ export default function PilotPanel({
   });
   const [weatherForecast, setWeatherForecast] = useState<WeatherHourItem[]>([]);
   const [dashboardMapTouchActive, setDashboardMapTouchActive] = useState(false);
+  const [dashboardMapType, setDashboardMapType] = useState<"standard" | "hybrid">("hybrid");
   const [expandedForecastKeys, setExpandedForecastKeys] = useState<string[]>([]);
   const [selectedForecastDayIndex, setSelectedForecastDayIndex] = useState(0);
   const [currentPlaceLabel, setCurrentPlaceLabel] = useState("Ubicación actual");
@@ -2342,6 +2432,7 @@ const [showTipoReporteModal, setShowTipoReporteModal] = useState(false);
     setFlightFirmaOperador("");
     setFlightNotas("");
     setFlightMisionId("");
+    setShowFlightMissionModal(false);
     setFlightLogSourceApp("DJI_FLY");
     setFlightDateObj(null);
     setShowFlightDate(false);
@@ -3022,14 +3113,33 @@ const removeEvidence = useCallback((id: string) => {
           DJIFlightLogSync.scanFlightLogs(),
         ]);
 
-        let pendingFiles = uniqueById(await getPendingDJIFlightLogs(scan.files));
+        const pilot2Files = scan.files.filter((file) => file.sourceApp === "DJI_PILOT_2");
+        const pilot2Locations = scan.locations.filter((location) => location.sourceApp === "DJI_PILOT_2");
+        const hasReadablePilot2Location = pilot2Locations.some(
+          (location) => location.exists && location.readable
+        );
+        const hasProtectedPilot2Route = pilot2Locations.some(
+          (location) => location.exists && !location.readable
+        );
         let nextSnapshot = snapshot;
-        let lastError: string | null = null;
+        if (!snapshot.knownFingerprints.length && pilot2Files.length) {
+          const todayStart = new Date();
+          todayStart.setHours(0, 0, 0, 0);
+          const historicalFiles = pilot2Files.filter((file) => file.lastModified < todayStart.getTime());
+          if (historicalFiles.length) nextSnapshot = await markDJIFlightLogsKnown(historicalFiles);
+        }
+        let pendingFiles = uniqueById(await getPendingDJIFlightLogs(pilot2Files));
+        let lastError: string | null =
+          !hasReadablePilot2Location && hasProtectedPilot2Route
+            ? "La ruta DJI Pilot 2 existe, pero Android no permite leerla todavía. Pulsa Autorizar carpeta y selecciona DJI/com.dji.industry.pilot/FlightRecord."
+            : null;
         let lastSuccessAt = settings.lastSuccessAt || null;
         let uploadedCount = 0;
 
         if ((upload || settings.enabled) && pendingFiles.length) {
-          if (!isOnlineRef.current) {
+          if (!djiDirectSyncMissionId) {
+            lastError = "Selecciona la misión antes de sincronizar los logs del RC Plus.";
+          } else if (!isOnlineRef.current) {
             lastError = "Sin conexión. Los logs detectados quedarán pendientes para el próximo escaneo.";
           } else {
             const uploadResults = await uploadFlightLogsOnlineService(
@@ -3040,7 +3150,8 @@ const removeEvidence = useCallback((id: string) => {
                 mimeType: file.mimeType,
                 size: file.size,
                 ext: file.ext,
-              }))
+              })),
+              djiDirectSyncMissionId
             );
 
             const uploadedIds = new Set(uploadResults.filter((item) => item.ok).map((item) => item.id));
@@ -3072,6 +3183,8 @@ const removeEvidence = useCallback((id: string) => {
         setDjiDirectSyncLastMessage(
           uploadedCount
             ? `${uploadedCount} log${uploadedCount === 1 ? "" : "s"} sincronizado${uploadedCount === 1 ? "" : "s"} en este escaneo.`
+            : lastError
+            ? lastError
             : pendingFiles.length
             ? `${pendingFiles.length} log${pendingFiles.length === 1 ? "" : "s"} pendiente${pendingFiles.length === 1 ? "" : "s"}.`
             : "No se encontraron logs nuevos pendientes."
@@ -3103,7 +3216,7 @@ const removeEvidence = useCallback((id: string) => {
         if (!silent) setDjiDirectSyncBusy(false);
       }
     },
-    []
+    [djiDirectSyncMissionId]
   );
 
   const toggleDJIDirectSyncEnabled = useCallback(async () => {
@@ -3171,6 +3284,35 @@ const removeEvidence = useCallback((id: string) => {
     },
     [runDJIDirectSyncScan]
   );
+
+  useEffect(() => {
+    if (section !== "flight-log") return;
+    refreshDJIDirectSyncState()
+      .then(async () => {
+        const settings = await getDJIDirectSyncSettings();
+        if (settings.enabled) {
+          await runDJIDirectSyncScan({ upload: true, silent: true });
+        } else {
+          await runDJIDirectSyncScan({ upload: false, silent: true });
+        }
+      })
+      .catch(() => {});
+  }, [section, refreshDJIDirectSyncState, runDJIDirectSyncScan]);
+
+  useEffect(() => {
+    const syncWhenEnabled = async () => {
+      const settings = await getDJIDirectSyncSettings();
+      if (settings.enabled) {
+        await runDJIDirectSyncScan({ upload: true, silent: true });
+      }
+    };
+
+    syncWhenEnabled().catch(() => {});
+    const subscription = AppState.addEventListener("change", (state) => {
+      if (state === "active") syncWhenEnabled().catch(() => {});
+    });
+    return () => subscription.remove();
+  }, [runDJIDirectSyncScan]);
 
   const loadDjiCloudStatus = useCallback(async () => {
     try {
@@ -3432,11 +3574,6 @@ const speakThenListen = useCallback((msg: string) => {
     return `${a}${b}`;
   }, [usuario?.nombre]);
 
-  const firstName = useMemo(() => {
-    const n = usuario?.nombre?.trim() || "Piloto";
-    return n.split(/\s+/)[0] || "Piloto";
-  }, [usuario?.nombre]);
-
   const [avatarLoadError, setAvatarLoadError] = useState(false);
   const userAvatarUri = useMemo(() => {
     const raw = String((usuario as any)?.fotoUrl || (usuario as any)?.foto || "").trim();
@@ -3500,7 +3637,7 @@ const speakThenListen = useCallback((msg: string) => {
         });
       });
 
-    alertas.slice(0, 8).forEach((alerta) => {
+    (Array.isArray(alertas) ? alertas : []).slice(0, 8).forEach((alerta) => {
       items.push({
         id: `alert-${alerta._id}`,
         title: alerta.tipo || "Alerta operacional",
@@ -3601,37 +3738,6 @@ const speakThenListen = useCallback((msg: string) => {
     }
     return null;
   }, [gpsCell.lat, gpsCell.lon]);
-  const dashboardMapHtml = useMemo(() => {
-    if (!dashboardMapCenter) return null;
-    return buildDashboardMapHtml({
-      center: dashboardMapCenter,
-      markerLabel:
-        gpsCell.enabled && gpsCell.lat != null && gpsCell.lon != null
-          ? `Posición actual ${gpsCell.lat.toFixed(5)}, ${gpsCell.lon.toFixed(5)}`
-          : "Ubicación de referencia",
-      weather: {
-        ok: weatherDetail.ok,
-        label: weatherDetail.label,
-        tempC: weatherDetail.tempC,
-        windMs: weatherDetail.windMs,
-        precipProbPct: weatherDetail.precipProbPct,
-        flightState: weatherDetail.flightState,
-      },
-      centerTick: dashboardMapCenterTick,
-    });
-  }, [
-    dashboardMapCenter,
-    dashboardMapCenterTick,
-    gpsCell.enabled,
-    gpsCell.lat,
-    gpsCell.lon,
-    weatherDetail.flightState,
-    weatherDetail.label,
-    weatherDetail.ok,
-    weatherDetail.precipProbPct,
-    weatherDetail.tempC,
-    weatherDetail.windMs,
-  ]);
   const dashboardLocationLabel = useMemo(() => {
     const base = String(currentPlaceLabel || "").trim();
     if (base) return base;
@@ -3988,7 +4094,7 @@ const speakThenListen = useCallback((msg: string) => {
 
   const prepChecks = useMemo(() => {
     const checklistDone = activeMission ? !!procStatusMap[activeMission._id]?.preflight : false;
-    const checks = [
+    const checks: Array<{ key: string; label: string; value: string; ok: boolean; optional?: boolean }> = [
       { key: "cert", label: "Certificado médico", value: certStatus.label, ok: certStatus.label === "Vigente" },
       { key: "cipu", label: "CIPU", value: usuario?.cipu || "Pendiente", ok: !!usuario?.cipu },
       { key: "mision", label: "Misión asignada hoy", value: missionToday?.titulo || "Sin misión", ok: !!missionToday },
@@ -4002,33 +4108,16 @@ const speakThenListen = useCallback((msg: string) => {
     [prepChecks]
   );
 
-  const bitacoraUasOptions = useMemo(() => {
-    const set = new Set<string>();
-    for (const v of vuelos || []) {
-      const uas = String((v as any)?.uas || "").trim();
-      if (uas) set.add(uas);
-    }
-    return Array.from(set).sort((a, b) => a.localeCompare(b, "es"));
-  }, [vuelos]);
-
-  const bitacoraMissionOptions = useMemo(() => {
-    return [...(misiones || [])].sort((a: any, b: any) => {
-      const da = new Date(a?.fechaOperacion || a?.fecha || 0).getTime();
-      const db = new Date(b?.fechaOperacion || b?.fecha || 0).getTime();
-      return db - da;
-    });
-  }, [misiones]);
-
-  const selectedBitacoraMissionLabel = useMemo(() => {
-    if (!flightFilterMission) return "";
-    const found = bitacoraMissionOptions.find((m: any) => String(m?._id) === String(flightFilterMission));
-    if (!found) return "";
-    return `${found?.titulo || "Misión"} · ${found?.estado || "Sin estado"}`;
-  }, [bitacoraMissionOptions, flightFilterMission]);
-
   const selectedFlightMission = useMemo(
     () => (flightMisionId ? (misiones || []).find((m) => String(m._id) === String(flightMisionId)) || null : null),
     [flightMisionId, misiones]
+  );
+
+  const selectedDjiDirectSyncMission = useMemo(
+    () => (djiDirectSyncMissionId
+      ? (misiones || []).find((m) => String(m._id) === String(djiDirectSyncMissionId)) || null
+      : null),
+    [djiDirectSyncMissionId, misiones]
   );
 
   const selectedFlightMissionLabel = useMemo(() => {
@@ -4038,15 +4127,7 @@ const speakThenListen = useCallback((msg: string) => {
     return "";
   }, [selectedFlightMission, activeMission, missionToday]);
 
-  const vuelosFiltrados = useMemo(() => {
-    return vuelos.filter((vuelo: any) => {
-      const vueloDate = formatDateOnly(vuelo.fechaHora);
-      const byDate = !flightFilterDate || vueloDate === flightFilterDate;
-      const byUas = !flightFilterUas || String(vuelo.uas || "").trim() === flightFilterUas;
-      const byMission = !flightFilterMission || String(vuelo.misionId || "") === String(flightFilterMission);
-      return byDate && byUas && byMission;
-    });
-  }, [flightFilterDate, flightFilterMission, flightFilterUas, vuelos]);
+  const vuelosFiltrados = vuelos;
 
   const similarReports = useMemo(() => {
     if (!repTipoCode) return [];
@@ -4054,8 +4135,9 @@ const speakThenListen = useCallback((msg: string) => {
   }, [repTipoCode, reportes]);
 
   const reportesVisibles = useMemo(() => {
-    return reportes.filter((r) => String(r.reporteClase || "SMS").toUpperCase() !== "MOR");
-  }, [reportes, section]);
+    const targetClass = repClase === "VOLUNTARIO" ? "VOLUNTARIO" : "SMS";
+    return reportes.filter((r) => String(r.reporteClase || "SMS").toUpperCase() === targetClass);
+  }, [reportes, repClase]);
 
   const reportesPaginados = useMemo(() => {
     const start = (reportesPage - 1) * PAGE_SIZE_REPORTES;
@@ -4107,9 +4189,40 @@ const speakThenListen = useCallback((msg: string) => {
     [misionesCumplidas.length]
   );
 
+  const equiposPaginados = useMemo(() => {
+    const start = (equiposPage - 1) * PAGE_SIZE_EQUIPOS;
+    return equipos.slice(start, start + PAGE_SIZE_EQUIPOS);
+  }, [equipos, equiposPage]);
+
+  const equiposPages = useMemo(
+    () => Math.max(1, Math.ceil(equipos.length / PAGE_SIZE_EQUIPOS)),
+    [equipos.length]
+  );
+
+  const misionesProcedimientos = useMemo(
+    () => misiones
+      .filter((m) => m.estado !== "Cumplida")
+      .filter((m) => !guidedFlowMissionId || String(m._id) === String(guidedFlowMissionId)),
+    [misiones, guidedFlowMissionId]
+  );
+
+  const procedimientosPaginados = useMemo(() => {
+    const start = (procedimientosPage - 1) * PAGE_SIZE_PROCEDIMIENTOS;
+    return misionesProcedimientos.slice(start, start + PAGE_SIZE_PROCEDIMIENTOS);
+  }, [misionesProcedimientos, procedimientosPage]);
+
+  const procedimientosPages = useMemo(
+    () => Math.max(1, Math.ceil(misionesProcedimientos.length / PAGE_SIZE_PROCEDIMIENTOS)),
+    [misionesProcedimientos.length]
+  );
+
   useEffect(() => {
     setReportesPage((prev) => Math.min(prev, reportesPages));
   }, [reportesPages]);
+
+  useEffect(() => {
+    setReportesPage(1);
+  }, [repClase]);
 
   useEffect(() => {
     setBitacoraPage((prev) => Math.min(prev, bitacoraPages));
@@ -4124,8 +4237,16 @@ const speakThenListen = useCallback((msg: string) => {
   }, [misionesCumplidasPages]);
 
   useEffect(() => {
-    setBitacoraPage(1);
-  }, [flightFilterDate, flightFilterMission, flightFilterUas]);
+    setEquiposPage((prev) => Math.min(prev, equiposPages));
+  }, [equiposPages]);
+
+  useEffect(() => {
+    setEquiposPage(1);
+  }, [equiposViewMode]);
+
+  useEffect(() => {
+    setProcedimientosPage((prev) => Math.min(prev, procedimientosPages));
+  }, [procedimientosPages]);
 
   useEffect(() => {
     if (section !== "my-reports") setReportesPage(1);
@@ -4134,6 +4255,8 @@ const speakThenListen = useCallback((msg: string) => {
       setMisionesProgramadasPage(1);
       setMisionesCumplidasPage(1);
     }
+    if (section !== "equipos-uas") setEquiposPage(1);
+    if (section !== "procedures") setProcedimientosPage(1);
   }, [section]);
 
   useEffect(() => {
@@ -4156,6 +4279,12 @@ const speakThenListen = useCallback((msg: string) => {
     usuario?.nombre,
     usuario?.documento,
   ]);
+
+  useEffect(() => {
+    if (djiDirectSyncMissionId) return;
+    const suggestedMissionId = String(activeMission?._id || missionToday?._id || "").trim();
+    if (suggestedMissionId) setDjiDirectSyncMissionId(suggestedMissionId);
+  }, [activeMission?._id, missionToday?._id, djiDirectSyncMissionId]);
 
   const loadSyncSummary = useCallback(async () => {
     const [procQueue, reportesQueue, vuelosQueue, doneQueue, fieldQueue] = await Promise.all([
@@ -4326,7 +4455,7 @@ const speakThenListen = useCallback((msg: string) => {
 
     return arr; // ✅ IMPORTANTE
   } catch (e) {
-    Toast.show({ type: "info", text1: "Modo offline", text2: "Mostrando misiones guardadas." });
+    await showDataFallbackNotice(e, "Mostrando misiones guardadas.");
     await loadOfflineMisiones();
     return []; // ✅
   } finally {
@@ -4366,6 +4495,134 @@ type ProcKind = "preflight" | "autoeval" | "battery";
 const [procMission, setProcMission] = useState<Mision | null>(null);
 const [showProcMissionModal, setShowProcMissionModal] = useState(false);
 const [pendingProc, setPendingProc] = useState<ProcKind | null>(null);
+const [companyChecklistTemplates, setCompanyChecklistTemplates] = useState<CompanyChecklistTemplate[]>([]);
+const [companyChecklistMission, setCompanyChecklistMission] = useState<Mision | null>(null);
+const [companyChecklistTemplate, setCompanyChecklistTemplate] = useState<CompanyChecklistTemplate | null>(null);
+const [companyChecklistStatus, setCompanyChecklistStatus] = useState<Record<string, CompanyChecklistSubmission>>({});
+const [companyChecklistAnswers, setCompanyChecklistAnswers] = useState<Record<string, boolean>>({});
+const [companyChecklistNotes, setCompanyChecklistNotes] = useState("");
+const [companyChecklistLoading, setCompanyChecklistLoading] = useState(false);
+const [companyChecklistSaving, setCompanyChecklistSaving] = useState(false);
+const [showCompanyChecklistModal, setShowCompanyChecklistModal] = useState(false);
+
+const loadCompanyChecklistTemplates = useCallback(async () => {
+  try {
+    const response = await apiFetch<ApiOk<CompanyChecklistTemplate[]>>("/api/procedures/company-checklists/templates");
+    setCompanyChecklistTemplates(Array.isArray(response?.data) ? response.data : []);
+  } catch (error) {
+    console.log("Listas empresariales:", (error as any)?.message || error);
+    setCompanyChecklistTemplates([]);
+  }
+}, []);
+
+useEffect(() => {
+  if (section === "procedures") loadCompanyChecklistTemplates();
+}, [section, loadCompanyChecklistTemplates]);
+
+const loadCompanyChecklistStatus = useCallback(async (misionId: string) => {
+  const response = await apiFetch<{ ok: boolean; map: Record<string, CompanyChecklistSubmission> }>(
+    `/api/procedures/company-checklists/status?misionId=${encodeURIComponent(misionId)}`
+  );
+  setCompanyChecklistStatus(response?.map || {});
+}, []);
+
+const openCompanyChecklists = useCallback(async (mision: Mision) => {
+  setCompanyChecklistMission(mision);
+  setCompanyChecklistTemplate(null);
+  setCompanyChecklistAnswers({});
+  setCompanyChecklistNotes("");
+  setShowCompanyChecklistModal(true);
+  setCompanyChecklistLoading(true);
+  try {
+    await loadCompanyChecklistStatus(mision._id);
+  } catch (error: any) {
+    Toast.show({ type: "error", text1: "Listas de verificación", text2: error?.message || "No se pudo consultar el avance." });
+  } finally {
+    setCompanyChecklistLoading(false);
+  }
+}, [loadCompanyChecklistStatus]);
+
+const selectCompanyChecklistTemplate = useCallback((template: CompanyChecklistTemplate) => {
+  const saved = companyChecklistStatus[template._id];
+  const answers: Record<string, boolean> = {};
+  (saved?.respuestas || []).forEach((item) => { answers[item.itemCodigo] = item.respuesta; });
+  setCompanyChecklistTemplate(template);
+  setCompanyChecklistAnswers(answers);
+  setCompanyChecklistNotes(saved?.observaciones || "");
+}, [companyChecklistStatus]);
+
+const saveCompanyChecklist = useCallback(async () => {
+  if (!companyChecklistMission || !companyChecklistTemplate) return;
+  const missing = companyChecklistTemplate.items.filter(
+    (item) => item.obligatorio && typeof companyChecklistAnswers[item.codigo] !== "boolean"
+  );
+  if (missing.length) {
+    Toast.show({ type: "error", text1: "Respuestas pendientes", text2: `Faltan ${missing.length} ítems por marcar.` });
+    return;
+  }
+
+  const clientId = makeLocalId(`company_${companyChecklistTemplate.codigo}`);
+  const respuestas = companyChecklistTemplate.items.map((item) => ({
+    itemCodigo: item.codigo,
+    respuesta: companyChecklistAnswers[item.codigo],
+  }));
+  const payload = {
+    templateId: companyChecklistTemplate._id,
+    misionId: companyChecklistMission._id,
+    respuestas,
+    observaciones: companyChecklistNotes.trim(),
+    clientId,
+    origen: "app",
+    offlineProcedureKind: "company-checklist",
+  };
+
+  setCompanyChecklistSaving(true);
+  try {
+    const net = await NetInfo.fetch();
+    if (!isNetInfoStateOnline(net)) {
+      await enqueueOfflineAction({
+        category: "procedure",
+        missionId: companyChecklistMission._id,
+        endpoint: "/api/procedures/company-checklists/submissions",
+        method: "POST",
+        body: { ...payload, origen: "offline" },
+      });
+      const localState: CompanyChecklistSubmission = {
+        templateId: companyChecklistTemplate._id,
+        templateCodigo: companyChecklistTemplate.codigo,
+        estado: respuestas.some((item) => !item.respuesta) ? "con_novedades" : "completada",
+        respuestas: companyChecklistTemplate.items.map((item) => ({
+          itemCodigo: item.codigo,
+          texto: item.texto,
+          respuesta: companyChecklistAnswers[item.codigo],
+        })),
+        observaciones: companyChecklistNotes.trim(),
+      };
+      setCompanyChecklistStatus((prev) => ({ ...prev, [companyChecklistTemplate._id]: localState }));
+      setCompanyChecklistTemplate(null);
+      await loadSyncSummary();
+      Toast.show({ type: "success", text1: "Guardado sin conexión", text2: "Se sincronizará automáticamente." });
+      return;
+    }
+
+    const response = await apiFetch<ApiOk<CompanyChecklistSubmission>>(
+      "/api/procedures/company-checklists/submissions",
+      { method: "POST", body: JSON.stringify(payload) }
+    );
+    if (!response?.ok || !response.data) throw new Error(response?.msg || "No se pudo guardar");
+    setCompanyChecklistStatus((prev) => ({ ...prev, [companyChecklistTemplate._id]: response.data! }));
+    setCompanyChecklistTemplate(null);
+    Toast.show({
+      type: "success",
+      text1: "Lista guardada",
+      text2: response.data.estado === "con_novedades" ? "Quedó registrada con novedades." : "Todos los ítems quedaron conformes.",
+    });
+  } catch (error: any) {
+    Toast.show({ type: "error", text1: "No se pudo guardar", text2: error?.message || "Intenta nuevamente." });
+  } finally {
+    setCompanyChecklistSaving(false);
+  }
+}, [companyChecklistAnswers, companyChecklistMission, companyChecklistNotes, companyChecklistTemplate, loadSyncSummary]);
 
 
 
@@ -4506,6 +4763,10 @@ const continueMissionProcedureFlow = useCallback((mision: Mision) => {
 
 const iniciarMision = useCallback((mision: Mision) => {
   closeKeyboard();
+  if (mision.dronpuerto && !mision.dronpuertoConfirmacion?.confirmado) {
+    Toast.show({ type: "info", text1: "Confirma el dronpuerto", text2: "Revisa el plano y confirma el DRP en sitio antes de iniciar." });
+    return;
+  }
   setActiveMissionId(mision._id);
   setGuidedFlowMissionId(mision._id);
   setProcMission(mision);
@@ -4516,6 +4777,33 @@ const iniciarMision = useCallback((mision: Mision) => {
     text2: "Completa procedimientos en la sección Procedimientos.",
   });
 }, [closeKeyboard, goSection]);
+
+const abrirUbicacionDronpuerto = useCallback(async (mision: Mision) => {
+  const lat = Number(mision?.dronpuerto?.drp?.latitude);
+  const lon = Number(mision?.dronpuerto?.drp?.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+    Toast.show({ type: "error", text1: "Ubicación no disponible", text2: "La misión no tiene coordenadas DRP válidas." });
+    return;
+  }
+  const url = Platform.select({ ios: `maps://?q=DRP&ll=${lat},${lon}`, default: `https://www.google.com/maps/search/?api=1&query=${lat},${lon}` })!;
+  await Linking.openURL(url).catch(() => Toast.show({ type: "error", text1: "No se pudo abrir el mapa" }));
+}, []);
+
+const confirmarDronpuertoMision = useCallback(async (mision: Mision) => {
+  try {
+    let payload: any = {};
+    const permission = await Location.requestForegroundPermissionsAsync();
+    if (permission.status === "granted") {
+      const position = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+      payload = { latitude: position.coords.latitude, longitude: position.coords.longitude, accuracy: position.coords.accuracy };
+    }
+    const response = await apiFetch<any>(`/api/misiones/${mision._id}/dronpuerto/confirmar`, { method: "PATCH", body: JSON.stringify(payload) });
+    setMisiones(prev => prev.map(item => item._id === mision._id ? { ...item, dronpuertoConfirmacion: response?.dronpuertoConfirmacion || { confirmado: true, confirmadoAt: new Date().toISOString() } } : item));
+    Toast.show({ type: "success", text1: "Dronpuerto confirmado", text2: "La verificación quedó registrada en la misión." });
+  } catch (error: any) {
+    Toast.show({ type: "error", text1: "No se pudo confirmar", text2: error?.message || "Intenta nuevamente." });
+  }
+}, []);
 
 const openProceduresAll = useCallback(() => {
   setGuidedFlowMissionId(null);
@@ -4615,7 +4903,7 @@ const addQrRead = useCallback(async () => {
   if (!operationMission?._id) return;
   const missionId = operationMission._id;
   const net = await NetInfo.fetch();
-  const online = !!net.isConnected && !!net.isInternetReachable;
+  const online = isNetInfoStateOnline(net);
   if (!online) {
     const current = operationStatusMap[missionId] || { qrReads: 0, started: false, batteryChanges: 0, finalized: false, awaitingTakeoff: false };
     markOperationStatus(missionId, { qrReads: current.qrReads + 1 });
@@ -4631,7 +4919,7 @@ const performStartOperation = useCallback(async () => {
   const missionId = operationMission._id;
   await startOperationTracking(missionId);
   const net = await NetInfo.fetch();
-  const online = !!net.isConnected && !!net.isInternetReachable;
+  const online = isNetInfoStateOnline(net);
   if (!online) {
     await queueOperationAction(missionId, `/api/misiones/${missionId}/flujo-operacion/iniciar`, "PATCH", {
       frat: fratRecordsMap[missionId] || null,
@@ -4713,7 +5001,7 @@ const registerBatteryChangeLanding = useCallback(async () => {
   if (!operationMission?._id) return;
   const missionId = operationMission._id;
   const net = await NetInfo.fetch();
-  const online = !!net.isConnected && !!net.isInternetReachable;
+  const online = isNetInfoStateOnline(net);
   if (!online) {
     await queueOperationAction(missionId, `/api/misiones/${missionId}/flujo-operacion/aterrizar-cambio`, "PATCH");
     const current = operationStatusMap[missionId] || { qrReads: 0, started: false, batteryChanges: 0, finalized: false, awaitingTakeoff: false };
@@ -4747,7 +5035,7 @@ const resumeOperationAfterBatteryChange = useCallback(async () => {
   if (!operationMission?._id) return;
   const missionId = operationMission._id;
   const net = await NetInfo.fetch();
-  const online = !!net.isConnected && !!net.isInternetReachable;
+  const online = isNetInfoStateOnline(net);
   if (!online) {
     await queueOperationAction(missionId, `/api/misiones/${missionId}/flujo-operacion/despegar`, "PATCH");
     markOperationStatus(missionId, { awaitingTakeoff: false, started: true });
@@ -4773,7 +5061,7 @@ const finalizeOperation = useCallback(async () => {
   const missionId = operationMission._id;
   const rutaGps = await stopOperationTracking(missionId);
   const net = await NetInfo.fetch();
-  const online = !!net.isConnected && !!net.isInternetReachable;
+  const online = isNetInfoStateOnline(net);
   if (!online) {
     await queueOperationAction(missionId, `/api/misiones/${missionId}/flujo-operacion/finalizar`, "PATCH", { rutaGps });
     markOperationStatus(missionId, { started: false, finalized: true, awaitingTakeoff: false });
@@ -4860,29 +5148,27 @@ const loadOfflineProfile = useCallback(async () => {
 
       // 2) Alertas y misiones en paralelo, sin tumbar el perfil
       const [aRes, msRes] = await Promise.allSettled([
-        apiFetch<Alerta[]>("/api/alertas"),
+        apiFetch<Alerta[] | { ok?: boolean; items?: Alerta[] }>("/api/alertas"),
         apiFetch<Mision[]>("/api/misiones"),
       ]);
 
-      if (aRes.status === "fulfilled") setAlertas(aRes.value || []);
-      if (msRes.status === "fulfilled") setMisiones(msRes.value || []);
+      if (aRes.status === "fulfilled") {
+        const response = aRes.value;
+        setAlertas(Array.isArray(response) ? response : Array.isArray(response?.items) ? response.items : []);
+      }
+      if (msRes.status === "fulfilled") setMisiones(Array.isArray(msRes.value) ? msRes.value : []);
 
       // 3) Solo si ni siquiera el perfil pudo cargar, usar offline
       if (!profileLoaded) {
-        Toast.show({
-          type: "info",
-          text1: "Modo offline",
-          text2: "Sin conexión. Mostrando datos guardados.",
-        });
+        await showDataFallbackNotice(
+          new Error("No se pudo actualizar el perfil. La sesión puede haber vencido."),
+          "Sin conexión. Mostrando datos guardados."
+        );
         await loadOfflineProfile();
       }
     } catch (e) {
       if (!profileLoaded) {
-        Toast.show({
-          type: "info",
-          text1: "Modo offline",
-          text2: "Sin conexión. Mostrando datos guardados.",
-        });
+        await showDataFallbackNotice(e, "Sin conexión. Mostrando datos guardados.");
         await loadOfflineProfile();
       }
     } finally {
@@ -4980,11 +5266,7 @@ const loadOfflineReportes = useCallback(async () => {
     });
   } catch (e: any) {
     // ✅ si no hay internet: pendientes + cache
-    Toast.show({
-      type: "info",
-      text1: "Modo offline",
-      text2: "Mostrando reportes guardados + pendientes.",
-    });
+    await showDataFallbackNotice(e, "Mostrando reportes guardados + pendientes.");
 
     const pending = await getReporteQueue();
     const pendingUI = pending.map(pendingToReporteUI);
@@ -5006,7 +5288,7 @@ const syncReportesQueue = useCallback(async () => {
     if (!q.length) return;
 
     const net = await NetInfo.fetch();
-    const online = !!net.isConnected && !!net.isInternetReachable;
+    const online = isNetInfoStateOnline(net);
     if (!online) return;
 
     const token = await getToken();
@@ -5048,7 +5330,7 @@ const syncReportesQueue = useCallback(async () => {
 
 useEffect(() => {
   const unsub = NetInfo.addEventListener((state) => {
-    const online = !!state.isConnected && !!state.isInternetReachable;
+    const online = isNetInfoStateOnline(state);
     if (online) syncReportesQueue();
   });
   return () => unsub();
@@ -5088,11 +5370,7 @@ const loadOfflineVuelos = useCallback(async () => {
       keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
     });
   } catch (e: any) {
-    Toast.show({
-      type: "info",
-      text1: "Modo offline",
-      text2: "Mostrando bitácoras guardadas + pendientes.",
-    });
+    await showDataFallbackNotice(e, "Mostrando bitácoras guardadas + pendientes.");
 
       const pending = await getVuelosQueue();
       const pendingUI = pending.map(pendingToVueloUI).map(normalizeVueloTimes);
@@ -5174,7 +5452,7 @@ const flushVuelosQueue = useCallback(async () => {
 
   try {
     const net = await NetInfo.fetch();
-    const online = !!net.isConnected && !!net.isInternetReachable;
+    const online = isNetInfoStateOnline(net);
     if (!online) return;
 
     let q = await getVuelosQueue();
@@ -5222,7 +5500,7 @@ const syncVuelosQueue = useCallback(async () => {
 
   try {
     const net = await NetInfo.fetch();
-    const online = !!net.isConnected && !!net.isInternetReachable;
+    const online = isNetInfoStateOnline(net);
     if (!online) return;
 
     const q = await getVuelosQueue();
@@ -5311,7 +5589,7 @@ const syncVuelosQueue = useCallback(async () => {
 
 useEffect(() => {
   const unsub = NetInfo.addEventListener((state) => {
-    const online = !!state.isConnected && !!state.isInternetReachable;
+    const online = isNetInfoStateOnline(state);
     if (online) {
       syncReportesQueue?.(); // si existe en tu scope
       syncVuelosQueue();
@@ -5341,7 +5619,7 @@ const loadOfflineEquipos = useCallback(async () => {
     const arr = raw ? JSON.parse(raw) : [];
     const visibles = isChiefPilotRole ? arr : filtrarEquiposVisiblesParaPiloto(arr);
     setEquipos(visibles);
-    setEquipoSel((prev) => (prev && visibles.some((e) => e._id === prev._id) ? prev : null));
+    setEquipoSel((prev) => (prev && visibles.some((e: EquipoUAS) => e._id === prev._id) ? prev : null));
   } catch (e) {
     console.log("Error cargando equipos offline:", e);
     setEquipos([]);
@@ -5374,7 +5652,7 @@ const loadEquipos = useCallback(async () => {
       });
       return next;
     });
-    setEquipoSel((prev) => (prev && arr.some((e) => e._id === prev._id) ? prev : null));
+    setEquipoSel((prev) => (prev && arr.some((e: EquipoUAS) => e._id === prev._id) ? prev : null));
 
     // ✅ cache offline
     await SecureStore.setItemAsync(SECURE_EQUIPOS_KEY, JSON.stringify(arr), {
@@ -5382,11 +5660,7 @@ const loadEquipos = useCallback(async () => {
     });
   } catch (e: any) {
     // ✅ fallback offline
-    Toast.show({
-      type: "info",
-      text1: "Modo offline",
-      text2: "Mostrando aeronaves guardadas.",
-    });
+    await showDataFallbackNotice(e, "Mostrando aeronaves guardadas.");
 
     await loadOfflineEquipos();
   } finally {
@@ -5691,67 +5965,41 @@ const loadGpsAndWeather = useCallback(async () => {
       return null;
     };
 
-    const url =
-      `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
-      "&current=temperature_2m,wind_speed_10m,wind_direction_10m,wind_gusts_10m,weather_code,relative_humidity_2m,surface_pressure,precipitation,rain,cloud_cover,visibility,shortwave_radiation,is_day" +
-      "&hourly=precipitation_probability,cloud_base" +
-      "&forecast_days=3&timezone=auto";
-
-    const res = await withTimeout(fetch(url), 10000);
-    const data = await res.json();
+    const data = await apiFetch<any>(
+      `/api/weather?lat=${encodeURIComponent(String(lat))}&lon=${encodeURIComponent(String(lon))}&units=metric&days=3`,
+      { method: "GET", auth: false }
+    );
     const current = data?.current || {};
-    const tempC = toNumberOrNull(current?.temperature_2m);
-    const windKmh = toNumberOrNull(current?.wind_speed_10m);
-    const windMs = windKmh != null ? windKmh / 3.6 : null;
-    const windDirDeg = toNumberOrNull(current?.wind_direction_10m);
-    const windGustKmh = toNumberOrNull(current?.wind_gusts_10m);
-    const windGustMs = windGustKmh != null ? windGustKmh / 3.6 : null;
-    const weatherCode = toNumberOrNull(current?.weather_code);
-    const humidityPct = toNumberOrNull(current?.relative_humidity_2m);
-    const pressureHpa = toNumberOrNull(current?.surface_pressure);
-    const rainMm = toNumberOrNull(current?.rain);
+    const tempC = toNumberOrNull(current?.temp);
+    const windMs = toNumberOrNull(current?.wind_speed);
+    const windDirDeg = toNumberOrNull(current?.wind_deg);
+    const windGustMs = toNumberOrNull(current?.wind_gust);
+    const weatherCode = null;
+    const humidityPct = toNumberOrNull(current?.humidity);
+    const pressureHpa = toNumberOrNull(current?.pressure);
+    const rainMm = toNumberOrNull(current?.rain ?? current?.precipitation);
     const visibilityM = toNumberOrNull(current?.visibility);
-    const cloudCoverPct = toNumberOrNull(current?.cloud_cover);
-    const radiationWm2 = toNumberOrNull(current?.shortwave_radiation);
-    const isDay = Number(current?.is_day) === 1;
-    const currentSkyLabel = deriveCurrentSkyLabel({
-      weatherCode,
-      cloudCoverPct,
-      radiationWm2,
-      rainMm,
-      isDay,
+    const cloudCoverPct = toNumberOrNull(current?.clouds);
+    const radiationWm2 = toNumberOrNull(current?.radiation);
+    const isDay = current?.is_day !== false;
+    const currentSkyLabel = String(current?.description || "").trim() || deriveCurrentSkyLabel({
+      weatherCode, cloudCoverPct, radiationWm2, rainMm, isDay,
     });
 
-    const hourlyTimes: string[] = Array.isArray(data?.hourly?.time) ? data.hourly.time : [];
-    const currentTime = typeof current?.time === "string" ? current.time : "";
-    let hourlyIndex = 0;
-    if (currentTime && hourlyTimes.length) {
-      const exact = hourlyTimes.indexOf(currentTime);
-      if (exact >= 0) {
-        hourlyIndex = exact;
-      } else {
-        const targetMs = Date.parse(currentTime);
-        if (Number.isFinite(targetMs)) {
-          let bestIdx = 0;
-          let bestDiff = Number.POSITIVE_INFINITY;
-          for (let i = 0; i < hourlyTimes.length; i++) {
-            const ms = Date.parse(hourlyTimes[i]);
-            if (!Number.isFinite(ms)) continue;
-            const diff = Math.abs(ms - targetMs);
-            if (diff < bestDiff) {
-              bestDiff = diff;
-              bestIdx = i;
-            }
-          }
-          hourlyIndex = bestIdx;
-        }
-      }
-    }
-
-    const precipProbPct = firstFiniteAround(data?.hourly?.precipitation_probability || [], hourlyIndex);
-    const cloudBaseM =
-      firstFiniteAround(data?.hourly?.cloud_base || [], hourlyIndex) ??
-      estimateCloudBaseMeters(tempC, humidityPct);
+    const hourlyData: any[] = Array.isArray(data?.hourly) ? data.hourly : [];
+    const hourlyTimes: string[] = hourlyData.map((item) => {
+      const timestamp = toNumberOrNull(item?.dt);
+      return timestamp != null ? new Date(timestamp * 1000).toISOString() : "";
+    });
+    const currentTime = typeof current?.observation_time === "string"
+      ? current.observation_time
+      : toNumberOrNull(current?.dt) != null
+        ? new Date(Number(current.dt) * 1000).toISOString()
+        : "";
+    const hourlyIndex = 0;
+    const precipProbPct =
+      toNumberOrNull(current?.precipitation_probability) ?? toNumberOrNull(hourlyData[0]?.pop);
+    const cloudBaseM = estimateCloudBaseMeters(tempC, humidityPct);
 
     // Kp geomagnético (NOAA). Si falla, se deja en null.
     let kpIndex: number | null = null;
@@ -5819,10 +6067,12 @@ const loadGpsAndWeather = useCallback(async () => {
     const satBlockedEstPct = Math.max(0, Math.min(100, Number((100 - (satVisibleEst / 32) * 100).toFixed(1))));
     const forecastRows: WeatherHourItem[] = hourlyTimes
       .map((isoTime, idx) => {
-        const cloudBaseSlot =
-          firstFiniteAround(data?.hourly?.cloud_base || [], idx) ??
-          cloudBaseM;
-        const precipSlot = firstFiniteAround(data?.hourly?.precipitation_probability || [], idx);
+        const hour = hourlyData[idx] || {};
+        const cloudBaseSlot = estimateCloudBaseMeters(
+          toNumberOrNull(hour?.temp),
+          toNumberOrNull(hour?.humidity)
+        ) ?? cloudBaseM;
+        const precipSlot = toNumberOrNull(hour?.pop);
         const satPenalty = Math.min(10, Math.round((Number(precipSlot || 0) / 100) * 6));
         const satSlot = Math.max(
           5,
@@ -5882,6 +6132,7 @@ const loadGpsAndWeather = useCallback(async () => {
     setWeatherDetail({
       ok: true,
       label: currentSkyLabel,
+      provider: String(current?.provider || "Google Weather"),
       tempC,
       windMs,
       windDirDeg,
@@ -6303,6 +6554,32 @@ useEffect(() => {
     const telemetrySub = DJITelemetry.onTelemetry((data) => {
       console.log("DJI telemetry event:", data);
       setTelemetry(data);
+
+      const latitude = Number(data?.lat);
+      const longitude = Number(data?.lng);
+      const now = Date.now();
+      if (!Number.isFinite(latitude) || !Number.isFinite(longitude) ||
+          (Math.abs(latitude) < 0.000001 && Math.abs(longitude) < 0.000001) ||
+          djiTelemetryPushRef.current.inFlight ||
+          now - djiTelemetryPushRef.current.lastSentAt < 2000) return;
+
+      djiTelemetryPushRef.current.inFlight = true;
+      djiTelemetryPushRef.current.lastSentAt = now;
+      void apiFetch("/api/dji-pilot/telemetry", {
+        method: "POST",
+        body: JSON.stringify({
+          latitude,
+          longitude,
+          altitude: data?.altitude,
+          batteryPercent: data?.batteryPercent,
+          speed: data?.speed,
+          timestamp: data?.timestamp || now,
+        }),
+      }).catch((error) => {
+        console.warn("No se pudo compartir telemetría DJI:", error?.message || error);
+      }).finally(() => {
+        djiTelemetryPushRef.current.inFlight = false;
+      });
     });
     const statusSub = DJITelemetry.onStatus((data) => {
       console.log("DJI status event:", data);
@@ -6400,7 +6677,7 @@ const isOnlineRef = React.useRef(true);
 
 useEffect(() => {
   const unsub = NetInfo.addEventListener((s) => {
-    isOnlineRef.current = !!s.isConnected && !!s.isInternetReachable;
+    isOnlineRef.current = isNetInfoStateOnline(s);
   });
   return () => unsub();
 }, []);
@@ -6424,24 +6701,46 @@ const [batteryStep, setBatteryStep] = useState(0);
 // solo para mostrar en UI
 const [voicePrompt, setVoicePrompt] = useState("");
 const [voiceBusy, setVoiceBusy] = useState(false);
+const speechSessionRef = React.useRef(0);
+const speechAfterTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
 const speakText = useCallback((msg: string, after?: () => void) => {
-  Speech.stop();
+  const session = ++speechSessionRef.current;
+  if (speechAfterTimerRef.current) {
+    clearTimeout(speechAfterTimerRef.current);
+    speechAfterTimerRef.current = null;
+  }
   setVoiceBusy(true);
   setVoicePrompt(msg);
 
-    Speech.speak(msg, {
-          language: isOnline ? "es-CO" : "es-ES",
+  void (async () => {
+    // En Android stop() es asíncrono. Si speak() se ejecuta antes de que
+    // termine, el stop anterior puede cancelar aleatoriamente la frase nueva.
+    try { await Speech.stop(); } catch {}
+    if (speechSessionRef.current !== session) return;
 
-      rate: 1.55, // más ágil para listas de chequeo
-    onDone: () => {
-      setVoiceBusy(false);
-      // ✅ Android: deja liberar el audio focus antes de escuchar
-      setTimeout(() => after?.(), 450);
-    },
-    onStopped: () => setVoiceBusy(false),
-    onError: () => setVoiceBusy(false),
-  });
+    Speech.speak(msg, {
+      language: isOnlineRef.current ? "es-CO" : "es-ES",
+      // expo-speech interpreta la velocidad de forma distinta en iOS.
+      // Android conserva su ritmo actual; iOS usa el equivalente perceptual.
+      rate: Platform.OS === "ios" ? 0.82 : 1.35,
+      onDone: () => {
+        if (speechSessionRef.current !== session) return;
+        setVoiceBusy(false);
+        // Android necesita liberar el audio focus antes de iniciar STT.
+        speechAfterTimerRef.current = setTimeout(() => {
+          speechAfterTimerRef.current = null;
+          if (speechSessionRef.current === session) after?.();
+        }, 450);
+      },
+      onStopped: () => {
+        if (speechSessionRef.current === session) setVoiceBusy(false);
+      },
+      onError: () => {
+        if (speechSessionRef.current === session) setVoiceBusy(false);
+      },
+    });
+  })();
 }, []);
 
 // ========= STT start/stop =========
@@ -6812,8 +7111,13 @@ useEffect(() => {
 
 // ========= Al cerrar: corta todo =========
 const stopAllVoice = useCallback(() => {
+  speechSessionRef.current += 1;
+  if (speechAfterTimerRef.current) {
+    clearTimeout(speechAfterTimerRef.current);
+    speechAfterTimerRef.current = null;
+  }
   stopListeningAuto();
-  Speech.stop();
+  void Speech.stop();
   setVoiceFlow("none");
   setVoiceStage("idle");
   setVoicePrompt("");
@@ -6821,6 +7125,13 @@ const stopAllVoice = useCallback(() => {
   setListening(false);
   setHeard("");
 }, [stopListeningAuto]);
+
+useEffect(() => () => {
+  speechSessionRef.current += 1;
+  if (speechAfterTimerRef.current) clearTimeout(speechAfterTimerRef.current);
+  void Speech.stop();
+  try { ExpoSpeechRecognitionModule.stop(); } catch {}
+}, []);
 
 const resetReporteForm = () => {
   setRepTipoCode("");
@@ -6890,6 +7201,7 @@ const resetReporteForm = () => {
   });
   setReportAttachments([]);
   setRepFormOpen(false);
+  goSection("my-reports");
 };
 
 
@@ -7038,7 +7350,7 @@ const resetReporteForm = () => {
 
     // ✅ Detectar conexión
     const net = await NetInfo.fetch();
-    const online = !!net.isConnected && !!net.isInternetReachable;
+    const online = isNetInfoStateOnline(net);
 
     // ✅ SIN INTERNET => guardar en cola offline y salir
     if (!online) {
@@ -7249,7 +7561,7 @@ const resetReporteForm = () => {
       }
 
       const net = await NetInfo.fetch();
-      const online = !!net.isConnected && !!net.isInternetReachable;
+    const online = isNetInfoStateOnline(net);
 
       if (!online) {
         Toast.show({
@@ -7630,7 +7942,7 @@ const openFieldDocument = async (type: "certificadoMedico" | "cipu" | "arl") => 
 
     // ✅ Evidencias y cierre: SOLO ONLINE
     const net = await NetInfo.fetch();
-    const online = !!net.isConnected && !!net.isInternetReachable;
+    const online = isNetInfoStateOnline(net);
 
     if (!online) {
       setEvidenceMissionId(misionId);
@@ -7723,7 +8035,7 @@ const syncMisionCumplidaQueue = useCallback(async () => {
 
   try {
     const net = await NetInfo.fetch();
-    const online = !!net.isConnected && !!net.isInternetReachable;
+    const online = isNetInfoStateOnline(net);
     if (!online) return;
 
     const q = await getQueue<PendingMisionDone>(SECURE_MISION_CUMPLIDA_QUEUE_KEY);
@@ -7774,7 +8086,7 @@ const syncMisionCumplidaQueue = useCallback(async () => {
     };
 
     const net = await NetInfo.fetch();
-    const online = !!net.isConnected && !!net.isInternetReachable;
+    const online = isNetInfoStateOnline(net);
 
     if (!online) {
       await enqueueOfflineAction({
@@ -7850,7 +8162,7 @@ async function saveAutoevaluacion() {
     };
 
     const net = await NetInfo.fetch();
-    const online = !!net.isConnected && !!net.isInternetReachable;
+    const online = isNetInfoStateOnline(net);
     if (!online) {
       await enqueueOfflineAction({
         category: "procedure",
@@ -7920,7 +8232,7 @@ async function saveBatteryChecklist() {
     };
 
     const net = await NetInfo.fetch();
-    const online = !!net.isConnected && !!net.isInternetReachable;
+    const online = isNetInfoStateOnline(net);
     if (!online) {
       await enqueueOfflineAction({
         category: "procedure",
@@ -7994,7 +8306,7 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
   if (!evidenceMissionId) return;
 
   const net = await NetInfo.fetch();
-  const online = !!net.isConnected && !!net.isInternetReachable;
+      const online = isNetInfoStateOnline(net);
 
   if (!online) {
     if (!evidenceItems.length) {
@@ -8368,7 +8680,7 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                   : PILOT_PANEL_BANNER_LOGO
               }
               style={[styles.bannerImg, isFlyNorthCompany && styles.flyNorthBannerImg]}
-              resizeMode={isFlyNorthCompany ? "contain" : "cover"}
+              resizeMode="contain"
             />
             {!isFlyNorthCompany && (
               <View style={styles.bannerOverlay}>
@@ -8455,7 +8767,7 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
 
           {/* USER STRIP */}
           <View style={styles.userStrip}>
-            <View style={styles.row}>
+            <View style={[styles.row, { width: "100%" }]}>
               <View style={styles.avatar}>
                 {userAvatarUriWithVersion && !avatarLoadError ? (
                   <Image
@@ -8488,24 +8800,10 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                 <>
                   <View style={styles.airReadyMapCard}>
                     <View style={styles.airSearchBar}>
-                      <View style={{ flex: 1, paddingRight: 10 }}>
+                      <View style={{ flex: 1 }}>
                         <Text style={styles.airSearchTitle} numberOfLines={1}>
                           {dashboardLocationLabel}
                         </Text>
-                        <Text style={styles.airSearchCoords} numberOfLines={1}>
-                          LAT: {gpsCell.lat != null ? gpsCell.lat.toFixed(5) : "—"} | LONG: {gpsCell.lon != null ? gpsCell.lon.toFixed(5) : "—"}
-                        </Text>
-                      </View>
-                      <View style={styles.airAvatarShell}>
-                        {userAvatarUriWithVersion && !avatarLoadError ? (
-                          <Image
-                            source={{ uri: userAvatarUriWithVersion }}
-                            style={styles.airAvatarImage}
-                            onError={() => setAvatarLoadError(true)}
-                          />
-                        ) : (
-                          <Text style={styles.airAvatarText}>{initials}</Text>
-                        )}
                       </View>
                     </View>
 
@@ -8515,17 +8813,31 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                         onPressOut={() => setDashboardMapTouchActive(false)}
                       >
                         <View style={{ flex: 1 }}>
-                          {dashboardMapHtml ? (
-                            <WebView
-                              key={`arcgis-imagery-v1-${dashboardMapCenter?.latitude ?? "na"}-${dashboardMapCenter?.longitude ?? "na"}`}
-                              originWhitelist={["*"]}
-                              source={{ html: dashboardMapHtml }}
-                              javaScriptEnabled
-                              domStorageEnabled
-                              cacheEnabled={false}
-                              scrollEnabled={false}
-                              nestedScrollEnabled
-                            />
+                          {dashboardMapCenter ? (
+                            IS_DJI_RC_PLUS ? (
+                              <WebView
+                                key={`rc-map-${dashboardMapCenterTick}-${dashboardMapType}-${dashboardMapCenter.latitude}-${dashboardMapCenter.longitude}`}
+                                style={StyleSheet.absoluteFillObject}
+                                source={{ html: buildRcDashboardMapHtml(dashboardMapCenter, dashboardLocationLabel, dashboardMapType) }}
+                                originWhitelist={["*"]}
+                                javaScriptEnabled
+                                domStorageEnabled
+                                mixedContentMode="always"
+                                setSupportMultipleWindows={false}
+                              />
+                            ) : (
+                              <MapView
+                                key={`google-map-${dashboardMapCenterTick}-${dashboardMapCenter.latitude}-${dashboardMapCenter.longitude}`}
+                                style={StyleSheet.absoluteFillObject}
+                                provider={PROVIDER_GOOGLE}
+                                mapType={dashboardMapType}
+                                initialRegion={{ ...dashboardMapCenter, latitudeDelta: 0.035, longitudeDelta: 0.035 }}
+                                showsUserLocation={gpsCell.enabled}
+                                showsMyLocationButton={false}
+                              >
+                                <Marker coordinate={dashboardMapCenter} title={dashboardLocationLabel} description={weatherDetail.ok ? `${weatherDetail.label} · ${weatherDetail.tempC?.toFixed(1) ?? "—"} °C` : "Ubicación actual"} pinColor="#14b8ff" />
+                              </MapView>
+                            )
                           ) : (
                             <View style={styles.airMapFallback}>
                               <MaterialCommunityIcons name="map-marker-off-outline" size={26} color="#6b7a8a" />
@@ -8535,8 +8847,25 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                         </View>
                       </TouchableWithoutFeedback>
 
-                      <View style={styles.airMapTopLeft}>
-                        <Text style={styles.airMapBadgeText}>ArcGIS · Satélite</Text>
+                      <View style={styles.airMapTypeSelector}>
+                        <Pressable
+                          accessibilityRole="button"
+                          accessibilityState={{ selected: dashboardMapType === "standard" }}
+                          style={[styles.airMapTypeOption, dashboardMapType === "standard" && styles.airMapTypeOptionActive]}
+                          onPress={() => setDashboardMapType("standard")}
+                        >
+                          <Ionicons name="map-outline" size={15} color={dashboardMapType === "standard" ? "#ffffff" : "#334155"} />
+                          <Text style={[styles.airMapTypeText, dashboardMapType === "standard" && styles.airMapTypeTextActive]}>Mapa</Text>
+                        </Pressable>
+                        <Pressable
+                          accessibilityRole="button"
+                          accessibilityState={{ selected: dashboardMapType === "hybrid" }}
+                          style={[styles.airMapTypeOption, dashboardMapType === "hybrid" && styles.airMapTypeOptionActive]}
+                          onPress={() => setDashboardMapType("hybrid")}
+                        >
+                          <Ionicons name="earth-outline" size={15} color={dashboardMapType === "hybrid" ? "#ffffff" : "#334155"} />
+                          <Text style={[styles.airMapTypeText, dashboardMapType === "hybrid" && styles.airMapTypeTextActive]}>Satélite</Text>
+                        </Pressable>
                       </View>
 
                       <Pressable
@@ -8556,7 +8885,21 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
 
                   <View style={styles.airConditionsSheet}>
                     <View style={styles.airSheetHandle} />
-                    <Text style={styles.airSectionEyebrow}>Condiciones</Text>
+                    <View style={styles.airConditionsBrandRow}>
+                      <Text style={styles.airSectionEyebrow}>Condiciones</Text>
+                      <View style={styles.airGoogleWeatherBadge} accessibilityLabel="Condiciones suministradas por Google Weather">
+                        <Text style={styles.airGoogleWordmark}>
+                          <Text style={{ color: "#4285F4" }}>G</Text>
+                          <Text style={{ color: "#DB4437" }}>o</Text>
+                          <Text style={{ color: "#F4B400" }}>o</Text>
+                          <Text style={{ color: "#4285F4" }}>g</Text>
+                          <Text style={{ color: "#0F9D58" }}>l</Text>
+                          <Text style={{ color: "#DB4437" }}>e</Text>
+                        </Text>
+                        <MaterialCommunityIcons name="weather-partly-cloudy" size={13} color="#4285F4" />
+                        <Text style={styles.airGoogleWeatherLabel}>Weather</Text>
+                      </View>
+                    </View>
 
                     <View style={styles.airConditionsHeader}>
                       <Pressable
@@ -8626,13 +8969,13 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                     onPress={() => navigation.navigate("ScreenBroadcast")}
                   >
                     <View style={styles.screenBroadcastIcon}>
-                      <MaterialCommunityIcons name="broadcast" size={26} color="#ffffff" />
+                      <MaterialCommunityIcons name="broadcast" size={21} color="#ffffff" />
                     </View>
                     <View style={{ flex: 1 }}>
                       <Text style={styles.screenBroadcastTitle}>Transmitir pantalla</Text>
-                      <Text style={styles.screenBroadcastText}>Emisión en vivo desde un control DJI RC Plus</Text>
+                      <Text style={styles.screenBroadcastText} numberOfLines={1}>DJI RC Plus o RC Pro Enterprise · emisión en vivo</Text>
                     </View>
-                    <Ionicons name="chevron-forward" size={22} color="#0799c1" />
+                    <Ionicons name="chevron-forward" size={18} color="#0799c1" />
                   </Pressable>
 
                   {false && (
@@ -8703,7 +9046,7 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                       <View style={styles.rowBetween}>
                         <View>
                           <Text style={styles.cardTitle}>Operación activa</Text>
-                          <Text style={styles.muted}>{activeMission.titulo || "Misión"} · {formatDateOnly(activeMission.fechaOperacion)}</Text>
+                          <Text style={styles.muted}>{activeMission?.titulo || "Misión"} · {formatDateOnly(activeMission?.fechaOperacion)}</Text>
                         </View>
                         <Pressable style={styles.btnMini} onPress={() => setSection("missions")}>
                           <Text style={styles.btnMiniText}>Ver misión</Text>
@@ -8814,7 +9157,7 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                     <View style={styles.kvRow}>
                       <KVP
                         label="Certificado médico"
-                        value={usuario?.fechaCertificado ? String(usuario.fechaCertificado).slice(0, 10) : "—"}
+                        value={usuario?.fechaCertificado ? String(usuario?.fechaCertificado).slice(0, 10) : "—"}
                         icon="calendar"
                         valueStyle={{ color: certStatus.color }}
                       />
@@ -8825,7 +9168,7 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                     <View style={{ marginTop: 10 }}>
                       <Text style={styles.kLabel}>Adiciones</Text>
                       {usuario?.adiciones?.length ? (
-                        usuario.adiciones.map((a, idx) => (
+                        usuario?.adiciones?.map((a, idx) => (
                           <View key={idx} style={styles.bulletRow}>
                             <View style={styles.bullet} />
                             <Text style={styles.bulletText}>{a}</Text>
@@ -9045,64 +9388,26 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
 
               {section === "ops-summary" && (
                 <>
-                    <View style={styles.card}>
-                      <Text style={styles.cardTitle}>Resumen operativo</Text>
-                      <View style={styles.kpiDeck}>
-                        <View style={styles.kpiTile}>
-                          <Text style={styles.kpiTileValue}>{misiones.filter((m) => sameDay(m.fechaOperacion)).length}</Text>
-                          <Text style={styles.kpiTileLabel}>Misiones de hoy</Text>
-                        </View>
-                        <View style={styles.kpiTile}>
-                          <Text style={styles.kpiTileValue}>{vuelosDelMes.length}</Text>
-                          <Text style={styles.kpiTileLabel}>Vuelos del mes</Text>
-                        </View>
-                        
-                        <View style={styles.kpiTile}>
-                          <Text style={styles.kpiTileValue}>{horasAcumuladas.toFixed(1)} h</Text>
-                          <Text style={styles.kpiTileLabel}>Horas acumuladas</Text>
-                        </View>
-                        <View style={styles.kpiTile}>
-                          <Text style={styles.kpiTileValue}>{procedimientosPendientes}</Text>
-                          <Text style={styles.kpiTileLabel}>Procedimientos pendientes</Text>
-                        </View>
-                        <View style={styles.kpiTile}>
-                          <Text style={styles.kpiTileValue}>{alertas.length}</Text>
-                          <Text style={styles.kpiTileLabel}>Alertas críticas</Text>
-                        </View>
-                        <View style={styles.kpiTile}>
-                          <Text style={styles.kpiTileValue}>{logsPendientes}</Text>
-                          <Text style={styles.kpiTileLabel}>Logs pendientes</Text>
-                        </View>
-                      </View>
+                  <View style={styles.card}>
+                    <Text style={styles.cardTitle}>Resumen operativo</Text>
+                    <View style={styles.kpiDeck}>
+                      <View style={styles.kpiTile}><Text style={styles.kpiTileValue}>{misiones.filter((m) => sameDay(m.fechaOperacion)).length}</Text><Text style={styles.kpiTileLabel}>Misiones de hoy</Text></View>
+                      <View style={styles.kpiTile}><Text style={styles.kpiTileValue}>{vuelosDelMes.length}</Text><Text style={styles.kpiTileLabel}>Vuelos del mes</Text></View>
+                      <View style={styles.kpiTile}><Text style={styles.kpiTileValue}>{horasAcumuladas.toFixed(1)} h</Text><Text style={styles.kpiTileLabel}>Horas acumuladas</Text></View>
+                      <View style={styles.kpiTile}><Text style={styles.kpiTileValue}>{procedimientosPendientes}</Text><Text style={styles.kpiTileLabel}>Procedimientos pendientes</Text></View>
+                      <View style={styles.kpiTile}><Text style={styles.kpiTileValue}>{alertas.length}</Text><Text style={styles.kpiTileLabel}>Alertas críticas</Text></View>
+                      <View style={styles.kpiTile}><Text style={styles.kpiTileValue}>{logsPendientes}</Text><Text style={styles.kpiTileLabel}>Logs pendientes</Text></View>
                     </View>
-
+                  </View>
                   <View style={styles.card}>
                     <Text style={styles.cardTitle}>KPIs de pilotaje</Text>
                     <View style={styles.kpiDeck}>
-                      <View style={styles.kpiTile}>
-                        <Text style={styles.kpiTileValue}>{horasHoy.toFixed(1)} h</Text>
-                        <Text style={styles.kpiTileLabel}>Horas hoy</Text>
-                      </View>
-                      <View style={styles.kpiTile}>
-                        <Text style={styles.kpiTileValue}>{horasSemana.toFixed(1)} h</Text>
-                        <Text style={styles.kpiTileLabel}>Horas semana</Text>
-                      </View>
-                      <View style={styles.kpiTile}>
-                        <Text style={styles.kpiTileValue}>{horasDelMes.toFixed(1)} h</Text>
-                        <Text style={styles.kpiTileLabel}>Horas mes</Text>
-                      </View>
-                      <View style={styles.kpiTile}>
-                        <Text style={styles.kpiTileValue}>{tasaIncidentesMes.toFixed(1)}%</Text>
-                        <Text style={styles.kpiTileLabel}>Tasa incidentes</Text>
-                      </View>
-                      <View style={styles.kpiTile}>
-                        <Text style={styles.kpiTileValue}>{cumplimientoChecklist.toFixed(0)}%</Text>
-                        <Text style={styles.kpiTileLabel}>Cumplimiento checklist</Text>
-                      </View>
-                      <View style={styles.kpiTile}>
-                        <Text style={styles.kpiTileValue}>{puntualidadMisiones.toFixed(0)}%</Text>
-                        <Text style={styles.kpiTileLabel}>Puntualidad misiones</Text>
-                      </View>
+                      <View style={styles.kpiTile}><Text style={styles.kpiTileValue}>{horasHoy.toFixed(1)} h</Text><Text style={styles.kpiTileLabel}>Horas hoy</Text></View>
+                      <View style={styles.kpiTile}><Text style={styles.kpiTileValue}>{horasSemana.toFixed(1)} h</Text><Text style={styles.kpiTileLabel}>Horas semana</Text></View>
+                      <View style={styles.kpiTile}><Text style={styles.kpiTileValue}>{horasDelMes.toFixed(1)} h</Text><Text style={styles.kpiTileLabel}>Horas mes</Text></View>
+                      <View style={styles.kpiTile}><Text style={styles.kpiTileValue}>{tasaIncidentesMes.toFixed(1)}%</Text><Text style={styles.kpiTileLabel}>Tasa incidentes</Text></View>
+                      <View style={styles.kpiTile}><Text style={styles.kpiTileValue}>{cumplimientoChecklist.toFixed(0)}%</Text><Text style={styles.kpiTileLabel}>Cumplimiento checklist</Text></View>
+                      <View style={styles.kpiTile}><Text style={styles.kpiTileValue}>{puntualidadMisiones.toFixed(0)}%</Text><Text style={styles.kpiTileLabel}>Puntualidad misiones</Text></View>
                     </View>
                   </View>
                 </>
@@ -9150,7 +9455,7 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                       </View>
                     ) : (
                       <View style={styles.equiposDeck}>
-                        {equipos.map((equipo) => (
+                        {equiposPaginados.map((equipo) => (
                           <View key={equipo._id} style={styles.equipoCardUas}>
                             <View style={styles.equipoCardMedia}>
                               {equipo.fotoUrl ? (
@@ -9379,6 +9684,25 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                             </View>
                           </View>
                         ))}
+                        {equipos.length > 0 && (
+                          <View style={styles.paginationRow}>
+                            <Pressable
+                              style={[styles.btnMini, equiposPage <= 1 && styles.paginationBtnDisabled]}
+                              disabled={equiposPage <= 1}
+                              onPress={() => setEquiposPage((prev) => Math.max(1, prev - 1))}
+                            >
+                              <Text style={styles.btnMiniText}>Anterior</Text>
+                            </Pressable>
+                            <Text style={styles.paginationText}>Página {equiposPage} de {equiposPages}</Text>
+                            <Pressable
+                              style={[styles.btnMini, equiposPage >= equiposPages && styles.paginationBtnDisabled]}
+                              disabled={equiposPage >= equiposPages}
+                              onPress={() => setEquiposPage((prev) => Math.min(equiposPages, prev + 1))}
+                            >
+                              <Text style={styles.btnMiniText}>Siguiente</Text>
+                            </Pressable>
+                          </View>
+                        )}
                       </View>
                     )}
                   </View>
@@ -9749,7 +10073,7 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                             label="Última sincronización"
                             value={
                               djiCloudStatus?.ultimoSyncAt
-                                ? formatDateOnly(djiCloudStatus.ultimoSyncAt)
+                                ? formatDateOnly(djiCloudStatus?.ultimoSyncAt)
                                 : djiCloudStatus?.syncSolicitadoAt
                                 ? "Solicitada"
                                 : "Sin sincronizar"
@@ -9762,10 +10086,10 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                             icon="airplane-clock"
                           />
                         </View>
-                        {!!djiCloudStatus?.notasIntegracion && <Text style={styles.muted}>{djiCloudStatus.notasIntegracion}</Text>}
-                        {!!djiCloudStatus?.ultimoResumenSync && <Text style={styles.muted}>{djiCloudStatus.ultimoResumenSync}</Text>}
+                        {!!djiCloudStatus?.notasIntegracion && <Text style={styles.muted}>{djiCloudStatus?.notasIntegracion}</Text>}
+                        {!!djiCloudStatus?.ultimoResumenSync && <Text style={styles.muted}>{djiCloudStatus?.ultimoResumenSync}</Text>}
                         {!!djiCloudStatus?.ultimoError && (
-                          <Text style={[styles.muted, { color: "#b91c1c" }]}>{djiCloudStatus.ultimoError}</Text>
+                          <Text style={[styles.muted, { color: "#b91c1c" }]}>{djiCloudStatus?.ultimoError}</Text>
                         )}
                         <View style={{ flexDirection: "row", flexWrap: "wrap", marginTop: 14 }}>
                           <Pressable
@@ -9850,6 +10174,21 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                         <Ionicons name="refresh" size={16} color="#111918" />
                         <Text style={styles.btnOutlineText}>Actualizar</Text>
                       </Pressable>
+                    </View>
+                    <View style={styles.weatherProviderRow}>
+                      <View style={styles.googleWeatherBadge} accessibilityLabel="Proveedor Google Weather">
+                        <Text style={styles.googleWordmark}>
+                          <Text style={{ color: "#4285F4" }}>G</Text>
+                          <Text style={{ color: "#DB4437" }}>o</Text>
+                          <Text style={{ color: "#F4B400" }}>o</Text>
+                          <Text style={{ color: "#4285F4" }}>g</Text>
+                          <Text style={{ color: "#0F9D58" }}>l</Text>
+                          <Text style={{ color: "#DB4437" }}>e</Text>
+                        </Text>
+                        <View style={styles.googleWeatherDivider} />
+                        <MaterialCommunityIcons name="weather-partly-cloudy" size={15} color="#4285F4" />
+                        <Text style={styles.googleWeatherText}>Weather</Text>
+                      </View>
                     </View>
 
                     <View
@@ -10019,14 +10358,14 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                         <View style={{ flex: 1 }}>
                           <Text style={styles.weatherMetricLabel}>Rumbo actual</Text>
                           <Text style={styles.weatherMetricValue}>
-                            {compass.headingDeg != null ? `${Math.round(compass.headingDeg)}°` : "—"}
+                            {compass.headingDeg != null ? `${Math.round(Number(compass.headingDeg))}°` : "—"}
                           </Text>
                           <Text style={styles.weatherMetricSub}>
                             {compass.supported ? `Dirección ${compass.headingLabel}` : compass.headingLabel}
                           </Text>
                           <Text style={styles.weatherMetricSub}>
-                            Lat: {gpsCell.lat != null ? gpsCell.lat.toFixed(6) : "—"} · Lng:{" "}
-                            {gpsCell.lon != null ? gpsCell.lon.toFixed(6) : "—"}
+                            Lat: {gpsCell.lat != null ? Number(gpsCell.lat).toFixed(6) : "—"} · Lng:{" "}
+                            {gpsCell.lon != null ? Number(gpsCell.lon).toFixed(6) : "—"}
                           </Text>
                         </View>
                       </View>
@@ -10089,7 +10428,7 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                         </View>
                       </View>
                       <Text style={styles.compassReadout}>
-                        {compass.headingDeg != null ? `${Math.round(compass.headingDeg)}\u00B0 ${compass.headingLabel}` : "—"}
+                        {compass.headingDeg != null ? `${Math.round(Number(compass.headingDeg))}\u00B0 ${compass.headingLabel}` : "—"}
                       </Text>
                       <Text style={styles.compassCoords}>
                         {toDms(gpsCell.lat, true)} · {toDms(gpsCell.lon, false)}
@@ -10171,17 +10510,36 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                       </View>
                     </View>
 
-                    <Text style={styles.muted}>
-                      Fuente: Open-Meteo · Observación: {formatWeatherObservation(weatherDetail.updatedAt)} · GPS de alta precisión
-                    </Text>
+                    <View style={styles.weatherAttributionRow}>
+                      <Text style={styles.weatherAttributionText}>
+                        Observación: {formatWeatherObservation(weatherDetail.updatedAt)} · GPS de alta precisión
+                      </Text>
+                    </View>
                   </View>
                 </>
               )}
 
               {/* NUEVO REPORTE */}
               {section === "new-report" && (
-                <View style={styles.card}>
-                  <View style={styles.rowBetween}>
+                <Modal
+                  visible
+                  animationType="fade"
+                  transparent
+                  statusBarTranslucent
+                  presentationStyle="overFullScreen"
+                  onRequestClose={() => {
+                    closeKeyboard();
+                    setRepFormOpen(false);
+                    goSection("my-reports");
+                  }}
+                >
+                  <View style={styles.modalOverlayCenter}>
+                    <KeyboardAvoidingView
+                      behavior={Platform.OS === "ios" ? "padding" : undefined}
+                      style={styles.modalWrap}
+                    >
+                      <View style={[styles.modalCard, { maxWidth: 760, maxHeight: "90%" }]}>
+                  <View style={styles.modalHeader}>
                     <Text style={styles.cardTitle}>
                       {repClase === "VOLUNTARIO"
                         ? "Nuevo reporte voluntario"
@@ -10189,13 +10547,24 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                         ? "Nuevo reporte MOR"
                         : "Nuevo reporte SMS"}
                     </Text>
-                    <Pressable onPress={() => setRepFormOpen((s) => !s)} style={styles.btnOutline}>
-                      <Ionicons name={repFormOpen ? "close" : "add"} size={16} color="#111918" />
-                      <Text style={styles.btnOutlineText}>{repFormOpen ? "Cerrar" : "Nuevo"}</Text>
+                    <Pressable
+                      onPress={() => {
+                        closeKeyboard();
+                        setRepFormOpen(false);
+                        goSection("my-reports");
+                      }}
+                      style={styles.iconBtn}
+                    >
+                      <Ionicons name="close" size={22} color="#111918" />
                     </Pressable>
                   </View>
 
-                  
+                  <ScrollView
+                    style={{ marginTop: 12 }}
+                    contentContainerStyle={{ paddingBottom: 20 }}
+                    keyboardShouldPersistTaps="handled"
+                    showsVerticalScrollIndicator={false}
+                  >
 
                   {repFormOpen ? (
                     <>
@@ -10860,7 +11229,14 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                           <Text style={styles.btnPrimaryText}>Enviar</Text>
                         </Pressable>
 
-                        <Pressable style={styles.btnGhost} onPress={() => setRepFormOpen(false)}>
+                        <Pressable
+                          style={styles.btnGhost}
+                          onPress={() => {
+                            closeKeyboard();
+                            setRepFormOpen(false);
+                            goSection("my-reports");
+                          }}
+                        >
                           <Text style={styles.btnGhostText}>Cancelar</Text>
                         </Pressable>
                       </View>
@@ -10868,7 +11244,11 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                   ) : (
                     <Text style={styles.muted}>Pulsa “Nuevo” para abrir el formulario.</Text>
                   )}
-                </View>
+                  </ScrollView>
+                      </View>
+                    </KeyboardAvoidingView>
+                  </View>
+                </Modal>
               )}
 
 
@@ -10937,21 +11317,24 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
               {section === "my-reports" && (
                 <>
                   <View style={styles.rowBetween}>
-                    <View />
+                    <Text style={styles.sectionTitle}>
+                      {repClase === "VOLUNTARIO" ? "Reportes voluntarios" : "Reportes SMS"}
+                    </Text>
                       <View style={[styles.row, { gap: 10, flexWrap: "wrap", marginBottom: 12 }]}>
                         <Pressable
                           style={styles.btnOutline}
                           onPress={() => {
-                            setRepClase("SMS");
                             setRepFormOpen(true);
                             goSection("new-report");
                           }}
                         >
                           <Ionicons name="add" size={16} color="#111918" />
-                          <Text style={styles.btnOutlineText}>Nuevo SMS</Text>
+                          <Text style={styles.btnOutlineText}>
+                            {repClase === "VOLUNTARIO" ? "Nuevo voluntario" : "Nuevo SMS"}
+                          </Text>
                         </Pressable>
 
-                        <Pressable
+                        {repClase !== "VOLUNTARIO" && <Pressable
                           style={styles.btnOutline}
                           onPress={() => {
                             setShowIncidentModal(true);
@@ -10959,7 +11342,7 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                         >
                           <Ionicons name="alert-circle-outline" size={16} color="#111918" />
                           <Text style={styles.btnOutlineText}>Nuevo incidente</Text>
-                        </Pressable>
+                        </Pressable>}
                       </View>
                   </View>
 
@@ -10971,7 +11354,9 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                   ) : reportesVisibles.length === 0 ? (
                     <View style={styles.emptyCard}>
                       <MaterialCommunityIcons name="clipboard-text-outline" size={22} color="#6b7a8a" />
-                      <Text style={styles.muted}>No hay reportes SMS.</Text>
+                      <Text style={styles.muted}>
+                        {repClase === "VOLUNTARIO" ? "No hay reportes voluntarios." : "No hay reportes SMS."}
+                      </Text>
                     </View>
                   ) : (
                     reportesPaginados.map((r) => (
@@ -11047,6 +11432,150 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                       </Pressable>
                     </View>
                   </View>
+
+                  {IS_DJI_RC_PLUS && DJIFlightLogSync.isAvailable && (
+                  <View style={[styles.card, { marginBottom: 12 }]}>
+                    <View style={styles.rowBetween}>
+                      <View style={{ flex: 1, paddingRight: 10 }}>
+                        <Text style={styles.cardTitle}>Sincronización automática DJI Pilot 2</Text>
+                        <Text style={styles.muted}>
+                          Busca los logs directamente en el control Enterprise y sube únicamente los archivos nuevos.
+                        </Text>
+                      </View>
+                      <View
+                        style={[
+                          styles.statusBadge,
+                          djiDirectSyncSettings.enabled ? styles.statusBadgeSuccess : styles.statusBadgeWarn,
+                        ]}
+                      >
+                        <Text style={styles.statusBadgeText}>
+                          {djiDirectSyncSettings.enabled ? "ACTIVA" : "PAUSADA"}
+                        </Text>
+                      </View>
+                    </View>
+
+                      <>
+                        <View style={{ marginTop: 12 }}>
+                          <Text style={styles.kLabel}>Acceso a registros de DJI Pilot 2</Text>
+                          <Text style={styles.muted}>
+                            {djiDirectSyncKnownSources.find((source) => source.sourceApp === "DJI_PILOT_2")?.persistedUri
+                              ? "Carpeta autorizada. El permiso queda guardado en este control."
+                              : "Autoriza una vez la carpeta LOG o FlightRecord de DJI Pilot 2."}
+                          </Text>
+                        </View>
+
+                        <View style={{ marginTop: 12 }}>
+                          <Text style={styles.kLabel}>Misión para los logs sincronizados *</Text>
+                          <Pressable
+                            style={[styles.input, styles.datePressable, { marginTop: 6 }]}
+                            onPress={() => setShowDjiDirectSyncMissions((open) => !open)}
+                          >
+                            <Text
+                              style={[styles.inputText, !selectedDjiDirectSyncMission && styles.placeholderText]}
+                              numberOfLines={1}
+                            >
+                              {selectedDjiDirectSyncMission?.titulo || "Selecciona una misión"}
+                            </Text>
+                            <Ionicons name="chevron-down" size={18} color="#111918" />
+                          </Pressable>
+                          <Text style={[styles.muted, { marginTop: 5 }]}>
+                            Los nuevos logs quedarán asociados a esta misión en la bitácora.
+                          </Text>
+
+                          {showDjiDirectSyncMissions && (
+                            <View style={{ marginTop: 8, maxHeight: 230 }}>
+                              <ScrollView nestedScrollEnabled showsVerticalScrollIndicator={false}>
+                                {[...(misiones || [])]
+                                  .sort((a, b) => new Date(b?.fechaOperacion || 0).getTime() - new Date(a?.fechaOperacion || 0).getTime())
+                                  .map((mission) => {
+                                    const selected = String(djiDirectSyncMissionId) === String(mission._id);
+                                    return (
+                                      <Pressable
+                                        key={String(mission._id)}
+                                        style={[styles.equipoItem, selected && styles.equipoItemActive]}
+                                        onPress={() => {
+                                          setDjiDirectSyncMissionId(String(mission._id));
+                                          setShowDjiDirectSyncMissions(false);
+                                          setDjiDirectSyncLastMessage(null);
+                                        }}
+                                      >
+                                        <Text style={styles.equipoTitle}>{mission.titulo || "Misión"}</Text>
+                                        <Text style={styles.equipoMeta}>
+                                          {formatDateOnly(mission.fechaOperacion)} · {mission.estado || "Sin estado"}
+                                        </Text>
+                                      </Pressable>
+                                    );
+                                  })}
+                                {!misiones.length && (
+                                  <Text style={[styles.muted, { paddingVertical: 10 }]}>No hay misiones disponibles.</Text>
+                                )}
+                              </ScrollView>
+                            </View>
+                          )}
+                        </View>
+
+                        <View style={[styles.row, { marginTop: 12, flexWrap: "wrap" }]}>
+                          <Pressable
+                            style={[styles.btnOutline, styles.mr10, djiDirectSyncBusy && { opacity: 0.6 }]}
+                            disabled={djiDirectSyncBusy}
+                            onPress={() => requestDJIFolderAccess("DJI_PILOT_2")}
+                          >
+                            <Ionicons name="folder-open-outline" size={16} color="#111918" />
+                            <Text style={styles.btnOutlineText}>Autorizar carpeta</Text>
+                          </Pressable>
+
+                          <Pressable
+                            style={[styles.btnPrimary, styles.mr10, (djiDirectSyncBusy || !djiDirectSyncMissionId) && { opacity: 0.6 }]}
+                            disabled={djiDirectSyncBusy || !djiDirectSyncMissionId}
+                            onPress={toggleDJIDirectSyncEnabled}
+                          >
+                            <Ionicons
+                              name={djiDirectSyncSettings.enabled ? "pause-outline" : "sync-outline"}
+                              size={16}
+                              color="#fff"
+                            />
+                            <Text style={styles.btnPrimaryText}>
+                              {djiDirectSyncSettings.enabled ? "Pausar automática" : "Activar automática"}
+                            </Text>
+                          </Pressable>
+
+                          <Pressable
+                            style={[styles.btnOutline, (djiDirectSyncBusy || !djiDirectSyncMissionId) && { opacity: 0.6 }]}
+                            disabled={djiDirectSyncBusy || !djiDirectSyncMissionId}
+                            onPress={() => runDJIDirectSyncScan({ upload: true })}
+                          >
+                            {djiDirectSyncBusy ? (
+                              <ActivityIndicator size="small" color="#111918" />
+                            ) : (
+                              <Ionicons name="cloud-upload-outline" size={16} color="#111918" />
+                            )}
+                            <Text style={styles.btnOutlineText}>
+                              {djiDirectSyncBusy ? "Sincronizando..." : "Sincronizar ahora"}
+                            </Text>
+                          </Pressable>
+                        </View>
+
+                        {!!djiDirectSyncLastMessage && (
+                          <Text style={[styles.muted, { marginTop: 12 }]}>{djiDirectSyncLastMessage}</Text>
+                        )}
+                        {!!djiDirectSyncSettings.lastError && (
+                          <Text style={[styles.logResultError, { marginTop: 6 }]}>
+                            {djiDirectSyncSettings.lastError}
+                          </Text>
+                        )}
+                        <View style={{ marginTop: 10 }}>
+                          <Text style={styles.muted}>
+                            Detectados pendientes: {djiDirectSyncPendingFiles.length} · Subidos recientemente: {djiDirectSyncUploads.length}
+                          </Text>
+                          {!!djiDirectSyncSettings.lastScanAt && (
+                            <Text style={styles.muted}>
+                              Última revisión: {formatDateOnly(djiDirectSyncSettings.lastScanAt)}
+                            </Text>
+                          )}
+                        </View>
+                      </>
+                  </View>
+                  )}
 
                   <View style={styles.card}>
                     <Text style={styles.cardTitle}>Resumen de bitácora</Text>
@@ -11132,159 +11661,6 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                     )}
                   </View>
 
-                  <View style={[styles.card, { marginBottom: 12 }]}>
-                    <Text style={styles.cardTitle}>Filtros</Text>
-                    <Field label="Fecha" icon="calendar-outline">
-                      <Pressable
-                        style={[styles.input, styles.datePressable]}
-                        onPress={() => setShowFlightFilterDate(true)}
-                      >
-                        <Text style={[styles.inputText, !flightFilterDate && styles.placeholderText]}>
-                          {flightFilterDate || "Seleccionar fecha"}
-                        </Text>
-                        <Ionicons name="calendar-outline" size={18} color="#4f5e6e" />
-                      </Pressable>
-                    </Field>
-                    <Field label="Aeronave" icon="drone">
-                      <Pressable
-                        style={[styles.input, styles.datePressable]}
-                        onPress={() => setShowFlightFilterUasModal(true)}
-                      >
-                        <Text style={[styles.inputText, !flightFilterUas && styles.placeholderText]}>
-                          {flightFilterUas || "Todas las aeronaves"}
-                        </Text>
-                        <Ionicons name="chevron-down" size={18} color="#111918" />
-                      </Pressable>
-                    </Field>
-                    <Field label="Misión" icon="map-marker-path">
-                      <Pressable
-                        style={[styles.input, styles.datePressable]}
-                        onPress={() => setShowFlightFilterMissionModal(true)}
-                      >
-                        <Text style={[styles.inputText, !flightFilterMission && styles.placeholderText]}>
-                          {selectedBitacoraMissionLabel || "Todas las misiones"}
-                        </Text>
-                        <Ionicons name="chevron-down" size={18} color="#111918" />
-                      </Pressable>
-                    </Field>
-                    <View style={styles.row}>
-                      <Pressable
-                        style={[styles.btnOutline, { marginTop: 6 }]}
-                        onPress={() => {
-                          setFlightFilterDate("");
-                          setFlightFilterUas("");
-                          setFlightFilterMission("");
-                        }}
-                      >
-                        <Ionicons name="close-circle-outline" size={16} color="#111918" />
-                        <Text style={styles.btnOutlineText}>Limpiar filtros</Text>
-                      </Pressable>
-                    </View>
-                  </View>
-
-                  {showFlightFilterDate && (
-                    <DateTimePicker
-                      value={flightFilterDate ? new Date(`${flightFilterDate}T00:00:00`) : new Date()}
-                      mode="date"
-                      display={Platform.OS === "ios" ? "spinner" : "default"}
-                      onChange={(event: DateTimePickerEvent, selected?: Date) => {
-                        if (Platform.OS !== "ios") setShowFlightFilterDate(false);
-                        if (event.type === "dismissed" || !selected) return;
-                        setFlightFilterDate(formatDateOnly(selected.toISOString()));
-                      }}
-                    />
-                  )}
-
-                  <Modal
-                    visible={showFlightFilterUasModal}
-                    animationType="fade"
-                    transparent
-                    statusBarTranslucent
-                    presentationStyle="overFullScreen"
-                    onRequestClose={() => setShowFlightFilterUasModal(false)}
-                  >
-                    <View style={styles.modalOverlayCenter}>
-                      <View style={styles.modalCardPro}>
-                        <View style={styles.modalHeader}>
-                          <Text style={styles.modalTitle}>Filtrar por aeronave</Text>
-                          <Pressable onPress={() => setShowFlightFilterUasModal(false)}>
-                            <Ionicons name="close" size={22} color="#111918" />
-                          </Pressable>
-                        </View>
-                        <ScrollView style={{ marginTop: 12 }} showsVerticalScrollIndicator={false}>
-                          <Pressable
-                            style={styles.equipoItem}
-                            onPress={() => {
-                              setFlightFilterUas("");
-                              setShowFlightFilterUasModal(false);
-                            }}
-                          >
-                            <Text style={styles.equipoTitle}>Todas las aeronaves</Text>
-                          </Pressable>
-                          {bitacoraUasOptions.map((uas) => (
-                            <Pressable
-                              key={uas}
-                              style={[styles.equipoItem, flightFilterUas === uas && styles.equipoItemActive]}
-                              onPress={() => {
-                                setFlightFilterUas(uas);
-                                setShowFlightFilterUasModal(false);
-                              }}
-                            >
-                              <Text style={styles.equipoTitle}>{uas}</Text>
-                            </Pressable>
-                          ))}
-                        </ScrollView>
-                      </View>
-                    </View>
-                  </Modal>
-
-                  <Modal
-                    visible={showFlightFilterMissionModal}
-                    animationType="fade"
-                    transparent
-                    statusBarTranslucent
-                    presentationStyle="overFullScreen"
-                    onRequestClose={() => setShowFlightFilterMissionModal(false)}
-                  >
-                    <View style={styles.modalOverlayCenter}>
-                      <View style={styles.modalCardPro}>
-                        <View style={styles.modalHeader}>
-                          <Text style={styles.modalTitle}>Filtrar por misión</Text>
-                          <Pressable onPress={() => setShowFlightFilterMissionModal(false)}>
-                            <Ionicons name="close" size={22} color="#111918" />
-                          </Pressable>
-                        </View>
-                        <ScrollView style={{ marginTop: 12 }} showsVerticalScrollIndicator={false}>
-                          <Pressable
-                            style={styles.equipoItem}
-                            onPress={() => {
-                              setFlightFilterMission("");
-                              setShowFlightFilterMissionModal(false);
-                            }}
-                          >
-                            <Text style={styles.equipoTitle}>Todas las misiones</Text>
-                          </Pressable>
-                          {bitacoraMissionOptions.map((m: any) => (
-                            <Pressable
-                              key={String(m?._id)}
-                              style={[
-                                styles.equipoItem,
-                                String(flightFilterMission) === String(m?._id) && styles.equipoItemActive,
-                              ]}
-                              onPress={() => {
-                                setFlightFilterMission(String(m?._id || ""));
-                                setShowFlightFilterMissionModal(false);
-                              }}
-                            >
-                              <Text style={styles.equipoTitle}>{m?.titulo || "Misión"}</Text>
-                              <Text style={styles.equipoMeta}>{m?.estado || "Sin estado"}</Text>
-                            </Pressable>
-                          ))}
-                        </ScrollView>
-                      </View>
-                    </View>
-                  </Modal>
-
                   {loadingVuelos ? (
                     <View style={styles.loadingBox}>
                       <ActivityIndicator />
@@ -11302,36 +11678,29 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                           <Text style={styles.flightTitle} numberOfLines={1}>{v.uas}</Text>
                           <View style={styles.flightBadges}>
                             <View style={[styles.statusBadge, v._local ? styles.statusBadgeWarn : styles.statusBadgeInfo]}>
-                              <Text style={styles.statusBadgeText}>{v._local ? "Pendiente" : "Sincronizado"}</Text>
+                              <Text style={styles.statusBadgeText} numberOfLines={1}>{v._local ? "Pendiente" : "Sincronizado"}</Text>
                             </View>
                             <View style={[styles.pill, { backgroundColor: "#e8f0ff", marginLeft: 8 }]}>
-                              <Text style={[styles.pillText, { color: "#111918" }]}>{v.tipoOperacion}</Text>
+                              <Text style={[styles.pillText, { color: "#111918", flexShrink: 1 }]} numberOfLines={1}>{v.tipoOperacion}</Text>
                             </View>
                           </View>
                         </View>
 
-                        <Text style={styles.flightMeta}>{v.fechaHora}</Text>
-                        <Text style={styles.flightMeta}>Ubicación: {v.ubicacion}</Text>
-                        <Text style={styles.flightMeta}>Propósito: {v.proposito}</Text>
-                        {!!v.categoriaOperacion && <Text style={styles.flightMeta}>Categoría: {v.categoriaOperacion}</Text>}
-                        <Text style={styles.flightMeta}>Inicio/Fin: {v.horaInicio || "—"} · {v.horaFin || "—"}</Text>
-
-                        <View style={styles.flightBottom}>
-                          <Text style={styles.flightDur}>{v.duracionMin} min</Text>
-                          <Text style={styles.flightLog}>Log: {v.logUrl ? (String(v.logUrl).includes("PENDIENTE") ? "Pendiente" : "Disponible") : "—"}</Text>
+                        <View style={[styles.rowBetween, { marginTop: 10 }]}>
+                          <Text style={styles.flightMeta}>{v.fechaHora || "Sin fecha"}</Text>
+                          <Text style={styles.flightDur}>{v.duracionMin || 0} min</Text>
                         </View>
 
-                        {!!v.notas && <Text style={styles.flightNotes}>{v.notas}</Text>}
-
-                        <View style={[styles.row, { marginTop: 10 }]}>
+                        <View style={{ marginTop: 12 }}>
                           <Pressable
-                            style={styles.btnMini}
+                            style={[styles.btnMini, { width: "100%", justifyContent: "center" }]}
                             onPress={() => {
                               setSelectedVuelo(v);
                               setShowFlightDetailModal(true);
                             }}
                           >
-                            <Text style={styles.btnMiniText}>Ver detalle</Text>
+                            <Ionicons name="information-circle-outline" size={16} color="#0d437c" />
+                            <Text style={styles.btnMiniText}>Ver información</Text>
                           </Pressable>
                         </View>
                       </View>
@@ -11401,7 +11770,13 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
       </View>
     ) : (
       <>
-        <Text style={styles.subTitle}>Programadas</Text>
+        <Text style={styles.subTitle}>Programadas ({misionesProgramadas.length})</Text>
+        {misionesProgramadas.length === 0 && (
+          <View style={styles.emptyCard}>
+            <MaterialCommunityIcons name="calendar-check-outline" size={22} color="#6b7a8a" />
+            <Text style={styles.muted}>No tienes misiones programadas.</Text>
+          </View>
+        )}
         {misionesProgramadasPaginadas.map((m) => {
     const instr = (m.instrucciones || "").trim();
     const prioridad = m.prioridad || "Media";
@@ -11423,15 +11798,45 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
       (m.estadoAutorizacionVuelo === "no_requiere" || Boolean(autorizacion?.key));
 
     const tieneMapa = !!(m as any)?.areaOperacion || !!m.kmlUrl || !!m.kmzUrl;
+    const isExpanded = expandedMissionId === m._id;
 
     return (
       <View key={m._id} style={styles.missionCard}>
         <View style={styles.rowBetween}>
-          <Text style={styles.missionId}>{m._id}</Text>
+          <View style={{ flex: 1, paddingRight: 10 }}>
+            <Text style={styles.cardTitle} numberOfLines={2}>{m.titulo || "Misión programada"}</Text>
+            <Text style={styles.muted}>{formatDateOnly(m.fechaOperacion)} · {formatHourOnly(m.horaInicio)}</Text>
+          </View>
           <View style={[styles.pill, prioridad === "Alta" ? styles.priorityHigh : prioridad === "Baja" ? styles.priorityLow : styles.priorityMedium]}>
             <Text style={[styles.pillText, { color: prioridadeColor(prioridad) }]}>{prioridad}</Text>
           </View>
         </View>
+
+        <Modal
+          visible={isExpanded}
+          animationType="fade"
+          transparent
+          statusBarTranslucent
+          presentationStyle="overFullScreen"
+          onRequestClose={() => setExpandedMissionId(null)}
+        >
+          <View style={styles.modalOverlayCenter}>
+            <View style={styles.modalWrap}>
+              <View style={[styles.modalCard, { maxWidth: 760, maxHeight: "88%" }]}>
+                <View style={styles.modalHeader}>
+                  <View style={{ flex: 1, paddingRight: 12 }}>
+                    <Text style={styles.modalTitle}>{m.titulo || "Información de la misión"}</Text>
+                    <Text style={styles.muted}>Misión programada</Text>
+                  </View>
+                  <Pressable style={styles.iconBtn} onPress={() => setExpandedMissionId(null)}>
+                    <Ionicons name="close" size={22} color="#111918" />
+                  </Pressable>
+                </View>
+                <ScrollView
+                  style={{ marginTop: 12 }}
+                  contentContainerStyle={{ paddingBottom: 24 }}
+                  showsVerticalScrollIndicator={false}
+                >
 
         {(relationLabels.length > 0 || m.esRepetitiva || m.estadoAprobacion === "pendiente" || m.estadoAprobacion === "aprobada") && (
           <View style={styles.missionRelationRow}>
@@ -11541,6 +11946,38 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
           </Text>
         )}
 
+        {!!m.dronpuerto && (
+          <View style={styles.pilotDroneportCard}>
+            <View style={styles.rowBetween}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.pilotDroneportTitle}>Dronpuerto asignado</Text>
+                <Text style={styles.pilotDroneportSubtitle}>{m.dronpuerto.modelo || sugerida} · {m.dronpuerto.ruas || "UAS"}</Text>
+              </View>
+              <View style={[styles.pill, m.dronpuerto.apto ? styles.pilotDroneportApto : styles.pilotDroneportWarning]}>
+                <Text style={styles.pillText}>{m.dronpuerto.apto ? "APTO" : "REVISAR"}</Text>
+              </View>
+            </View>
+
+            <View style={styles.pilotDroneportGrid}>
+              <View><Text style={styles.kLabel}>DRP</Text><Text style={styles.pilotDroneportValue}>{Number(m.dronpuerto.drp?.latitude).toFixed(5)}, {Number(m.dronpuerto.drp?.longitude).toFixed(5)}</Text></View>
+              <View><Text style={styles.kLabel}>TLOF</Text><Text style={styles.pilotDroneportValue}>{Number(m.dronpuerto.medidas?.tlof || 0).toFixed(2)} m</Text></View>
+              <View><Text style={styles.kLabel}>FATO</Text><Text style={styles.pilotDroneportValue}>{Number(m.dronpuerto.medidas?.fato || 0).toFixed(2)} m</Text></View>
+              <View><Text style={styles.kLabel}>SA</Text><Text style={styles.pilotDroneportValue}>{Number(m.dronpuerto.medidas?.seguridad || 0).toFixed(2)} m</Text></View>
+              <View><Text style={styles.kLabel}>Operación</Text><Text style={styles.pilotDroneportValue}>{Number(m.dronpuerto.medidas?.operacion || 0).toFixed(2)} m</Text></View>
+              <View><Text style={styles.kLabel}>Espectadores</Text><Text style={styles.pilotDroneportValue}>{Number(m.dronpuerto.medidas?.espectadores || 0).toFixed(2)} m</Text></View>
+            </View>
+
+            <View style={[styles.row, { marginTop: 10, flexWrap: "wrap", gap: 8 }]}>
+              <Pressable style={styles.btnMini} onPress={() => { setMisionMapa(m); setShowMisionMapa(true); }}><Text style={styles.btnMiniText}>Ver plano</Text></Pressable>
+              <Pressable style={styles.btnMini} onPress={() => abrirUbicacionDronpuerto(m)}><Text style={styles.btnMiniText}>Cómo llegar</Text></Pressable>
+              <Pressable style={[styles.btnPrimary, { flex: 1, minWidth: 145 }, m.dronpuertoConfirmacion?.confirmado && styles.paginationBtnDisabled]} disabled={!!m.dronpuertoConfirmacion?.confirmado} onPress={() => confirmarDronpuertoMision(m)}>
+                <Ionicons name={m.dronpuertoConfirmacion?.confirmado ? "checkmark-circle" : "location-outline"} size={16} color="#fff" />
+                <Text style={styles.btnPrimaryText}>{m.dronpuertoConfirmacion?.confirmado ? "Dronpuerto confirmado" : "Confirmar en sitio"}</Text>
+              </Pressable>
+            </View>
+          </View>
+        )}
+
         {(autorizacion || adjuntos.length > 0) && (
           <View style={styles.missionFilesBox}>
             <Text style={styles.missionFilesTitle}>Adjuntos de misión</Text>
@@ -11581,11 +12018,35 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
             ))}
           </View>
         )}
+                </ScrollView>
+              </View>
+            </View>
+          </View>
+        </Modal>
 
-        <View style={[styles.row, { marginTop: 10, flexWrap: "wrap", gap: 10 }]}>
-          {/* ✅ MAPA */}
+        <View style={{ marginTop: 10, gap: 10 }}>
+          <View style={[styles.row, { width: "100%", gap: 10 }]}>
+            <Pressable
+              style={[styles.btnMini, { flex: 1, justifyContent: "center" }]}
+              onPress={() => setExpandedMissionId(m._id)}
+            >
+              <Ionicons name="information-circle-outline" size={16} color="#0d437c" />
+              <Text style={styles.btnMiniText}>Ver información</Text>
+            </Pressable>
+
+            <Pressable
+              style={[styles.btnPrimary, { flex: 1, justifyContent: "center" }, !operationReady && styles.paginationBtnDisabled]}
+              onPress={() => iniciarMision(m)}
+              disabled={!operationReady}
+            >
+              <Ionicons name="play" size={16} color="white" />
+              <Text style={styles.btnPrimaryText}>{operationReady ? "Iniciar misión" : "Esperando aprobación"}</Text>
+            </Pressable>
+          </View>
+
+          <View style={[styles.row, { width: "100%", gap: 10 }]}>
           <Pressable
-            style={[styles.btnMini, { minWidth: 110, opacity: tieneMapa ? 1 : 0.45 }]}
+            style={[styles.btnMini, { flex: 1, justifyContent: "center", opacity: tieneMapa ? 1 : 0.45 }]}
             onPress={() => {
               setMisionMapa(m);
               setShowMisionMapa(true);
@@ -11595,22 +12056,13 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
             <Text style={styles.btnMiniText}>{tieneMapa ? "Mapa" : "Sin mapa"}</Text>
           </Pressable>
 
-          {/* ✅ Cumplida */}
           <Pressable
-            style={[styles.btnPrimary, { flex: 1, minWidth: 140 }, !operationReady && styles.paginationBtnDisabled]}
-            onPress={() => iniciarMision(m)}
-            disabled={!operationReady}
-          >
-            <Ionicons name="play" size={16} color="white" />
-            <Text style={styles.btnPrimaryText}>{operationReady ? "Iniciar misión" : "Esperando aprobación"}</Text>
-          </Pressable>
-
-          <Pressable
-            style={[styles.btnOutline, { minWidth: 120, justifyContent: "center" }]}
+            style={[styles.btnOutline, { flex: 1, justifyContent: "center" }]}
             onPress={() => marcarMisionCumplida(m._id)}
           >
             <Text style={styles.btnOutlineText}>Marcar cumplida</Text>
           </Pressable>
+          </View>
         </View>
       </View>
     );
@@ -11642,19 +12094,63 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
 
 
 
-        <Text style={[styles.subTitle, { marginTop: 18 }]}>Cumplidas</Text>
+        <Text style={[styles.subTitle, { marginTop: 18 }]}>Cumplidas ({misionesCumplidas.length})</Text>
+        {misionesCumplidas.length === 0 && (
+          <View style={styles.emptyCard}>
+            <MaterialCommunityIcons name="check-circle-outline" size={22} color="#6b7a8a" />
+            <Text style={styles.muted}>Todavía no hay misiones cumplidas.</Text>
+          </View>
+        )}
         {misionesCumplidasPaginadas.map((m) => {
           const descripcion = (m.descripcion || m.instrucciones || m.titulo || "—").trim() || "—";
           const fechaCumplida = formatDateOnly((m as any).fechaOperacion || (m as any).fecha);
           const relationLabels = getMissionRelationLabels(m, usuario?._id);
+          const isExpanded = expandedMissionId === m._id;
           return (
             <View key={m._id} style={[styles.missionCard, { opacity: 0.95 }]}>
               <View style={styles.rowBetween}>
-                <Text style={styles.missionId}>{m._id}</Text>
+                <View style={{ flex: 1, paddingRight: 10 }}>
+                  <Text style={styles.cardTitle} numberOfLines={2}>{m.titulo || "Misión cumplida"}</Text>
+                  <Text style={styles.muted}>{fechaCumplida}</Text>
+                </View>
                 <View style={[styles.pill, { backgroundColor: "#e7f7ec" }]}>
                   <Text style={[styles.pillText, { color: "#0a5a22" }]}>Cumplida</Text>
                 </View>
               </View>
+
+              <Pressable
+                style={[styles.btnMini, { marginTop: 12, width: "100%", justifyContent: "center" }]}
+                onPress={() => setExpandedMissionId(isExpanded ? null : m._id)}
+              >
+                <Ionicons name={isExpanded ? "chevron-up" : "information-circle-outline"} size={16} color="#0d437c" />
+                <Text style={styles.btnMiniText}>{isExpanded ? "Ocultar información" : "Ver información"}</Text>
+              </Pressable>
+
+              <Modal
+                visible={isExpanded}
+                animationType="fade"
+                transparent
+                statusBarTranslucent
+                presentationStyle="overFullScreen"
+                onRequestClose={() => setExpandedMissionId(null)}
+              >
+                <View style={styles.modalOverlayCenter}>
+                  <View style={styles.modalWrap}>
+                    <View style={[styles.modalCard, { maxWidth: 760, maxHeight: "88%" }]}>
+                      <View style={styles.modalHeader}>
+                        <View style={{ flex: 1, paddingRight: 12 }}>
+                          <Text style={styles.modalTitle}>{m.titulo || "Información de la misión"}</Text>
+                          <Text style={styles.muted}>Misión cumplida</Text>
+                        </View>
+                        <Pressable style={styles.iconBtn} onPress={() => setExpandedMissionId(null)}>
+                          <Ionicons name="close" size={22} color="#111918" />
+                        </Pressable>
+                      </View>
+                      <ScrollView
+                        style={{ marginTop: 12 }}
+                        contentContainerStyle={{ paddingBottom: 24 }}
+                        showsVerticalScrollIndicator={false}
+                      >
 
               {(relationLabels.length > 0 || m.esRepetitiva) && (
                 <View style={styles.missionRelationRow}>
@@ -11705,6 +12201,11 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                   </Pressable>
                 </View>
               ) : null}
+                      </ScrollView>
+                    </View>
+                  </View>
+                </View>
+              </Modal>
             </View>
           );
         })}
@@ -11770,52 +12271,28 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
     return <Text style={styles.muted}>Esta misión no tiene coordenadas válidas.</Text>;
   }
 
-  const polygonLatLng = coords.map((c) => [c.latitude, c.longitude]); // Leaflet usa [lat,lng]
-
-  const html = `
-  <!DOCTYPE html>
-  <html>
-  <head>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <style>
-      html, body, #map { height: 100%; margin: 0; padding: 0; background: #fff; }
-      .leaflet-control-attribution { display: none; }
-    </style>
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  </head>
-  <body>
-    <div id="map"></div>
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    <script>
-      const polygon = ${JSON.stringify(polygonLatLng)};
-
-      const map = L.map("map", { zoomControl: true });
-
-      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        maxZoom: 19
-      }).addTo(map);
-
-      const poly = L.polygon(polygon, {
-        color: "#111918",
-        weight: 3,
-        fillColor: "#111918",
-        fillOpacity: 0.25
-      }).addTo(map);
-
-      map.fitBounds(poly.getBounds(), { padding: [20, 20] });
-    </script>
-  </body>
-  </html>
-  `;
+  const droneport = misionMapa?.dronpuerto || null;
+  const droneportCenter = droneport?.drp ? { latitude: Number(droneport.drp.latitude), longitude: Number(droneport.drp.longitude) } : null;
+  const allCoordinates = droneportCenter && Number.isFinite(droneportCenter.latitude) && Number.isFinite(droneportCenter.longitude) ? [...coords, droneportCenter] : coords;
+  const latitudes = allCoordinates.map((point) => point.latitude);
+  const longitudes = allCoordinates.map((point) => point.longitude);
+  const minLat = Math.min(...latitudes), maxLat = Math.max(...latitudes), minLon = Math.min(...longitudes), maxLon = Math.max(...longitudes);
+  const region = { latitude: (minLat + maxLat) / 2, longitude: (minLon + maxLon) / 2, latitudeDelta: Math.max((maxLat - minLat) * 1.5, .008), longitudeDelta: Math.max((maxLon - minLon) * 1.5, .008) };
+  const zones = droneportCenter ? [
+    [Number(droneport?.medidas?.espectadores || 0) / 2, "#8996a8", "rgba(137,150,168,.08)"],
+    [Number(droneport?.medidas?.operacion || 0) / 2, "#58a9c9", "rgba(88,169,201,.10)"],
+    [Number(droneport?.medidas?.seguridad || 0) / 2, "#29a9dc", "rgba(41,169,220,.14)"],
+    [Number(droneport?.medidas?.fato || 0) / 2, "#138dbd", "rgba(19,141,189,.18)"],
+    [Number(droneport?.medidas?.tlof || 0) / 2, "#0d437c", "rgba(13,67,124,.28)"],
+  ] as Array<[number, string, string]> : [];
 
   return (
     <View style={{ height: 360, marginTop: 12, borderRadius: 16, overflow: "hidden" }}>
-      <WebView
-        originWhitelist={["*"]}
-        source={{ html }}
-        javaScriptEnabled
-        domStorageEnabled
-      />
+      <MapView style={StyleSheet.absoluteFillObject} provider={PROVIDER_GOOGLE} mapType="hybrid" initialRegion={region}>
+        <MapPolygon coordinates={coords} strokeColor="#2563eb" strokeWidth={3} fillColor="rgba(37,99,235,.24)" />
+        {droneportCenter && zones.map(([radius, color, fillColor], index) => radius > 0 ? <MapCircle key={`dp-zone-${index}`} center={droneportCenter} radius={radius} strokeColor={color} strokeWidth={2} fillColor={fillColor} /> : null)}
+        {droneportCenter && <Marker coordinate={droneportCenter} title="Dronpuerto" description="Punto de aterrizaje y despegue" pinColor="#0d437c" />}
+      </MapView>
     </View>
   );
 })()}
@@ -12058,23 +12535,33 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                 <>
                   <Text style={styles.sectionTitle}>Procedimientos por misión</Text>
 
+                  {companyChecklistTemplates.length > 0 && (
+                    <View style={styles.companyChecklistIntro}>
+                      <View style={styles.companyChecklistIntroIcon}>
+                        <MaterialCommunityIcons name="clipboard-check-multiple-outline" size={22} color="#057ea8" />
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={styles.companyChecklistIntroTitle}>Listas operacionales CONDITEC</Text>
+                        <Text style={styles.companyChecklistIntroText}>
+                          {companyChecklistTemplates.length} fases con respuesta manual Sí/No. Cada registro queda asociado a la misión y al piloto.
+                        </Text>
+                      </View>
+                    </View>
+                  )}
+
                   {loadingMisiones ? (
                     <View style={styles.loadingBox}>
                       <ActivityIndicator />
                       <Text style={styles.muted}>Cargando misiones...</Text>
                     </View>
-                  ) : misiones
-                      .filter((m) => m.estado !== "Cumplida")
-                      .filter((m) => !guidedFlowMissionId || String(m._id) === String(guidedFlowMissionId)).length === 0 ? (
+                  ) : misionesProcedimientos.length === 0 ? (
                     <View style={styles.emptyCard}>
                       <MaterialCommunityIcons name="clipboard-check-outline" size={22} color="#6b7a8a" />
                       <Text style={styles.muted}>No hay misiones pendientes para flujo operativo.</Text>
                     </View>
                   ) : (
-                    misiones
-                      .filter((m) => m.estado !== "Cumplida")
-                      .filter((m) => !guidedFlowMissionId || String(m._id) === String(guidedFlowMissionId))
-                      .map((m) => {
+                    <>
+                    {procedimientosPaginados.map((m) => {
                         const proc = procStatusMap[m._id] || { preflight: false, autoeval: false, battery: false };
                         const procDone = [proc.preflight, proc.autoeval, proc.battery].filter(Boolean).length;
                         const opStatus = operationStatusMap[m._id] || { qrReads: 0, started: false, batteryChanges: 0, finalized: false, awaitingTakeoff: false };
@@ -12130,6 +12617,15 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                             )}
 
                             <View style={[styles.row, { marginTop: 10, flexWrap: "wrap", gap: 10 }]}>
+                              {companyChecklistTemplates.length > 0 && (
+                                <Pressable
+                                  style={[styles.btnMini, styles.companyChecklistOpenButton]}
+                                  onPress={() => openCompanyChecklists(m)}
+                                >
+                                  <MaterialCommunityIcons name="clipboard-list-outline" size={17} color="#057ea8" />
+                                  <Text style={styles.companyChecklistOpenButtonText}>Listas CONDITEC</Text>
+                                </Pressable>
+                              )}
                               <Pressable
                                 style={[styles.btnPrimary, { flex: 1, minWidth: 170 }]}
                                 onPress={() => continueMissionProcedureFlow(m)}
@@ -12151,7 +12647,25 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                             </View>
                           </View>
                         );
-                      })
+                      })}
+                    <View style={styles.paginationRow}>
+                      <Pressable
+                        style={[styles.btnMini, procedimientosPage <= 1 && styles.paginationBtnDisabled]}
+                        disabled={procedimientosPage <= 1}
+                        onPress={() => setProcedimientosPage((prev) => Math.max(1, prev - 1))}
+                      >
+                        <Text style={styles.btnMiniText}>Anterior</Text>
+                      </Pressable>
+                      <Text style={styles.paginationText}>Página {procedimientosPage} de {procedimientosPages}</Text>
+                      <Pressable
+                        style={[styles.btnMini, procedimientosPage >= procedimientosPages && styles.paginationBtnDisabled]}
+                        disabled={procedimientosPage >= procedimientosPages}
+                        onPress={() => setProcedimientosPage((prev) => Math.min(procedimientosPages, prev + 1))}
+                      >
+                        <Text style={styles.btnMiniText}>Siguiente</Text>
+                      </Pressable>
+                    </View>
+                    </>
                   )}
 
                 </>
@@ -12160,6 +12674,132 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
             </>
           )}
         </ScrollView>
+
+{/* LISTAS EMPRESARIALES — manuales, sin voz */}
+<Modal
+  visible={showCompanyChecklistModal}
+  animationType="fade"
+  transparent
+  statusBarTranslucent
+  presentationStyle="overFullScreen"
+  onRequestClose={() => {
+    if (companyChecklistTemplate) setCompanyChecklistTemplate(null);
+    else setShowCompanyChecklistModal(false);
+  }}
+>
+  <View style={styles.modalOverlayCenter}>
+    <View style={[styles.modalCardPro, { maxHeight: "90%" }]}>
+      <View style={styles.modalHeader}>
+        <View style={{ flex: 1, paddingRight: 12 }}>
+          <Text style={styles.modalTitle}>
+            {companyChecklistTemplate?.titulo || "Listas operacionales CONDITEC"}
+          </Text>
+          <Text style={styles.companyChecklistModalSubtitle} numberOfLines={2}>
+            {companyChecklistMission?.titulo || "Misión seleccionada"}
+          </Text>
+        </View>
+        <Pressable
+          style={styles.iconBtn}
+          disabled={companyChecklistSaving}
+          onPress={() => {
+            if (companyChecklistTemplate) setCompanyChecklistTemplate(null);
+            else setShowCompanyChecklistModal(false);
+          }}
+        >
+          <Ionicons name={companyChecklistTemplate ? "arrow-back" : "close"} size={22} color="#111918" />
+        </Pressable>
+      </View>
+
+      {companyChecklistLoading ? (
+        <View style={styles.loadingBox}>
+          <ActivityIndicator color="#057ea8" />
+          <Text style={styles.muted}>Consultando listas...</Text>
+        </View>
+      ) : companyChecklistTemplate ? (
+        <ScrollView keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
+          <View style={styles.companyChecklistProgressBox}>
+            <Text style={styles.companyChecklistProgressText}>
+              {Object.keys(companyChecklistAnswers).length}/{companyChecklistTemplate.items.length} respondidos
+            </Text>
+            <Text style={styles.companyChecklistProgressHint}>Marca Sí o No en cada verificación.</Text>
+          </View>
+
+          {companyChecklistTemplate.items.map((item, index) => {
+            const answer = companyChecklistAnswers[item.codigo];
+            return (
+              <View key={item.codigo} style={styles.companyChecklistQuestion}>
+                <View style={styles.companyChecklistNumber}><Text style={styles.companyChecklistNumberText}>{index + 1}</Text></View>
+                <Text style={styles.companyChecklistQuestionText}>{item.texto}</Text>
+                <View style={styles.companyChecklistAnswers}>
+                  <Pressable
+                    style={[styles.companyChecklistAnswer, answer === true && styles.companyChecklistAnswerYes]}
+                    onPress={() => setCompanyChecklistAnswers((prev) => ({ ...prev, [item.codigo]: true }))}
+                  >
+                    <MaterialCommunityIcons name="check-circle-outline" size={18} color={answer === true ? "#fff" : "#138a5b"} />
+                    <Text style={[styles.companyChecklistAnswerText, answer === true && styles.companyChecklistAnswerTextActive]}>Sí</Text>
+                  </Pressable>
+                  <Pressable
+                    style={[styles.companyChecklistAnswer, answer === false && styles.companyChecklistAnswerNo]}
+                    onPress={() => setCompanyChecklistAnswers((prev) => ({ ...prev, [item.codigo]: false }))}
+                  >
+                    <MaterialCommunityIcons name="close-circle-outline" size={18} color={answer === false ? "#fff" : "#c33d4b"} />
+                    <Text style={[styles.companyChecklistAnswerText, answer === false && styles.companyChecklistAnswerTextActive]}>No</Text>
+                  </Pressable>
+                </View>
+              </View>
+            );
+          })}
+
+          <Text style={styles.companyChecklistNotesLabel}>Observaciones (opcional)</Text>
+          <TextInput
+            style={[styles.input, styles.companyChecklistNotes]}
+            multiline
+            value={companyChecklistNotes}
+            onChangeText={setCompanyChecklistNotes}
+            placeholder="Registra novedades, acciones o aclaraciones."
+            placeholderTextColor="#8a96a3"
+          />
+          <Pressable
+            style={[styles.btnPrimary, { marginTop: 14 }, companyChecklistSaving && { opacity: 0.6 }]}
+            disabled={companyChecklistSaving}
+            onPress={saveCompanyChecklist}
+          >
+            {companyChecklistSaving ? <ActivityIndicator color="#fff" /> : <MaterialCommunityIcons name="content-save-check-outline" size={18} color="#fff" />}
+            <Text style={styles.btnPrimaryText}>{companyChecklistSaving ? "Guardando..." : "Guardar lista"}</Text>
+          </Pressable>
+        </ScrollView>
+      ) : (
+        <ScrollView showsVerticalScrollIndicator={false}>
+          {companyChecklistTemplates.map((template) => {
+            const saved = companyChecklistStatus[template._id];
+            return (
+              <Pressable
+                key={template._id}
+                style={styles.companyChecklistPhase}
+                onPress={() => selectCompanyChecklistTemplate(template)}
+              >
+                <View style={[
+                  styles.companyChecklistPhaseIcon,
+                  saved?.estado === "completada" && styles.companyChecklistPhaseIconDone,
+                  saved?.estado === "con_novedades" && styles.companyChecklistPhaseIconWarning,
+                ]}>
+                  <Text style={styles.companyChecklistPhaseIconText}>{template.orden}</Text>
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.companyChecklistPhaseTitle}>{template.titulo}</Text>
+                  <Text style={styles.companyChecklistPhaseMeta}>
+                    {template.items.length} verificaciones · {saved ? (saved.estado === "con_novedades" ? "Completada con novedades" : "Completada") : "Pendiente"}
+                  </Text>
+                </View>
+                <MaterialCommunityIcons name={saved ? "check-circle" : "chevron-right"} size={22} color={saved?.estado === "con_novedades" ? "#d97706" : saved ? "#138a5b" : "#8190a0"} />
+              </Pressable>
+            );
+          })}
+        </ScrollView>
+      )}
+    </View>
+  </View>
+</Modal>
 
 {/* ✅ MODAL — SELECCIONAR MISIÓN PARA PROCEDIMIENTO */}
 <Modal
@@ -12961,7 +13601,7 @@ return disponibles.map((m) => {
             <Pressable
               onPress={() => {
                 closeKeyboard();
-                setShowFlightMissionModal(true);
+                setShowFlightMissionModal((open) => !open);
               }}
               style={({ pressed }) => [
                 styles.input,
@@ -12978,6 +13618,54 @@ return disponibles.map((m) => {
               <Text style={[styles.muted, { marginTop: 6 }]}>
                 {selectedFlightMission.estado || "Sin estado"} · {String(selectedFlightMission.fechaOperacion || "").slice(0, 10)}
               </Text>
+            )}
+            {showFlightMissionModal && (
+              <View style={{ marginTop: 8, maxHeight: 280 }}>
+                <ScrollView nestedScrollEnabled showsVerticalScrollIndicator={false}>
+                  <Pressable
+                    style={[styles.equipoItem, !flightMisionId && styles.equipoItemActive]}
+                    onPress={() => {
+                      setFlightMisionId("");
+                      setShowFlightMissionModal(false);
+                    }}
+                  >
+                    <Text style={styles.equipoTitle}>Sin misión</Text>
+                    <Text style={styles.equipoMeta}>Guardar el vuelo sin asociarlo.</Text>
+                  </Pressable>
+
+                  {[...(misiones || [])]
+                    .sort((a, b) => {
+                      const da = new Date(a?.fechaOperacion || 0).getTime();
+                      const db = new Date(b?.fechaOperacion || 0).getTime();
+                      return db - da;
+                    })
+                    .map((m) => {
+                      const selected = String(flightMisionId) === String(m._id);
+                      return (
+                        <Pressable
+                          key={String(m._id)}
+                          style={[styles.equipoItem, selected && styles.equipoItemActive]}
+                          onPress={() => {
+                            setFlightMisionId(String(m._id));
+                            setShowFlightMissionModal(false);
+                          }}
+                        >
+                          <Text style={styles.equipoTitle}>{m.titulo || "Misión"}</Text>
+                          <Text style={styles.equipoMeta}>
+                            {String(m.fechaOperacion || "").slice(0, 10) || "Sin fecha"} · {m.estado || "Sin estado"}
+                          </Text>
+                          {!!m.ubicacionGeneral && (
+                            <Text style={styles.equipoMeta}>Ubicación: {m.ubicacionGeneral}</Text>
+                          )}
+                        </Pressable>
+                      );
+                    })}
+
+                  {!misiones?.length && (
+                    <Text style={[styles.muted, { paddingVertical: 12 }]}>No hay misiones disponibles.</Text>
+                  )}
+                </ScrollView>
+              </View>
             )}
           </Field>
 
@@ -13100,70 +13788,6 @@ return disponibles.map((m) => {
       </KeyboardAvoidingView>
     </Pressable>
   </Pressable>
-</Modal>
-
-<Modal
-  visible={showFlightMissionModal}
-  animationType="fade"
-  transparent
-  statusBarTranslucent
-  presentationStyle="overFullScreen"
-  onRequestClose={() => setShowFlightMissionModal(false)}
->
-  <View style={styles.modalOverlayCenter}>
-    <View style={[styles.modalCardPro, { maxHeight: "80%" }]}>
-      <View style={styles.modalHeader}>
-        <Text style={styles.modalTitle}>Asociar misión al vuelo</Text>
-        <Pressable onPress={() => setShowFlightMissionModal(false)}>
-          <Ionicons name="close" size={22} color="#111918" />
-        </Pressable>
-      </View>
-
-      <ScrollView style={{ marginTop: 12 }} showsVerticalScrollIndicator={false}>
-        <Pressable
-          style={[styles.equipoItem, !flightMisionId && styles.equipoItemActive]}
-          onPress={() => {
-            setFlightMisionId("");
-            setShowFlightMissionModal(false);
-          }}
-        >
-          <Text style={styles.equipoTitle}>Sin misión</Text>
-          <Text style={styles.equipoMeta}>Guardar el vuelo sin asociación.</Text>
-        </Pressable>
-
-        {(misiones || [])
-          .filter((m) => String(m?.estado || "").toLowerCase() !== "cumplida")
-          .sort((a, b) => {
-            const da = new Date(a?.fechaOperacion || 0).getTime();
-            const db = new Date(b?.fechaOperacion || 0).getTime();
-            return db - da;
-          })
-          .map((m) => {
-            const selected = String(flightMisionId) === String(m._id);
-            return (
-              <Pressable
-                key={m._id}
-                onPress={() => {
-                  setFlightMisionId(String(m._id));
-                  setShowFlightMissionModal(false);
-                }}
-                style={[styles.equipoItem, selected && styles.equipoItemActive]}
-              >
-                <Text style={styles.equipoTitle}>{m.titulo || "Misión"}</Text>
-                <Text style={styles.equipoMeta}>
-                  {String(m.fechaOperacion || "").slice(0, 10)} · {m.estado || "Sin estado"}
-                </Text>
-                {!!m.ubicacionGeneral && (
-                  <Text style={styles.equipoMeta}>Ubicación: {m.ubicacionGeneral}</Text>
-                )}
-              </Pressable>
-            );
-          })}
-
-        <View style={{ height: 10 }} />
-      </ScrollView>
-    </View>
-  </View>
 </Modal>
 
 {/* ✅ MODAL 4 — AERONAVES REGISTRADAS (CENTRADO) */}
@@ -13652,16 +14276,21 @@ return disponibles.map((m) => {
           <NavItem
             icon="clipboard-list-outline"
             label="Rep. SMS"
-            active={section === "my-reports" || (section === "new-report" && repClase !== "VOLUNTARIO")}
-            onPress={() => goSection("my-reports")}
+            active={(section === "my-reports" || section === "new-report") && repClase !== "VOLUNTARIO"}
+            onPress={() => {
+              setRepClase("SMS");
+              setRepFormOpen(false);
+              goSection("my-reports");
+            }}
           />
           <NavItem
             icon="file-document-outline"
             label="Reporte voluntario"
-            active={section === "new-report" && repClase === "VOLUNTARIO"}
+            active={(section === "my-reports" || section === "new-report") && repClase === "VOLUNTARIO"}
             onPress={() => {
               setRepClase("VOLUNTARIO");
-              goSection("new-report");
+              setRepFormOpen(false);
+              goSection("my-reports");
             }}
           />
           <NavItem icon="weather-partly-cloudy" label="Clima" active={section === "weather"} onPress={() => goSection("weather")} />
@@ -13694,21 +14323,8 @@ return disponibles.map((m) => {
         </Pressable>
       </Animated.View>
 
+      {false && <>
       <Pressable style={styles.alfabotFab} onPress={toggleAlfabot} hitSlop={10}>
-        <Animated.View
-          pointerEvents="none"
-          style={[
-            styles.alfabotFabWave,
-            { transform: [{ scale: alfabotWaveScale1 }], opacity: alfabotWaveOpacity1 },
-          ]}
-        />
-        <Animated.View
-          pointerEvents="none"
-          style={[
-            styles.alfabotFabWave,
-            { transform: [{ scale: alfabotWaveScale2 }], opacity: alfabotWaveOpacity2 },
-          ]}
-        />
         <Image source={ALFABOT_BOT_IMG} style={styles.alfabotFabImg} />
       </Pressable>
 
@@ -13731,38 +14347,49 @@ return disponibles.map((m) => {
             <View style={[styles.alfabotCard, alfabotKbVisible && styles.alfabotCardKeyboard]}>
               <View style={styles.alfabotHeader}>
                 <View style={styles.alfabotHeaderLeft}>
-                  <Image source={ALFABOT_BOT_IMG} style={styles.alfabotAvatar} />
+                  <LinearGradient colors={["#67dbea", "#0891b2"]} style={styles.alfabotAvatarShell}>
+                    <Image source={ALFABOT_BOT_IMG} style={styles.alfabotAvatar} />
+                  </LinearGradient>
                   <View>
                     <Text style={styles.alfabotTitle}>AlfaBot</Text>
-                    <Text style={styles.alfabotSubtitle}>Asistente operacional</Text>
+                    <Text style={styles.alfabotSubtitle}>Asistente de inteligencia artificial</Text>
                   </View>
                 </View>
                 <Pressable onPress={closeAlfabot} style={styles.alfabotClose}>
-                  <Text style={styles.alfabotCloseText}>X</Text>
+                  <Ionicons name="close" size={18} color="#0891b2" />
                 </Pressable>
               </View>
 
               <ScrollView
                 style={styles.alfabotBody}
-                ref={(r) => (alfabotScrollRef.current = r)}
+                ref={(r) => {
+                  alfabotScrollRef.current = r;
+                }}
                 keyboardShouldPersistTaps="handled"
                 contentContainerStyle={styles.alfabotBodyContent}
                 onContentSizeChange={() => alfabotScrollRef.current?.scrollToEnd({ animated: true })}
               >
-                {alfabotMessages.map((m, i) => (
-                  <View
-                    key={`${m.at}_${i}`}
-                    style={[styles.alfabotMsg, m.role === "user" && styles.alfabotMsgUser]}
-                  >
-                    <Text style={[styles.alfabotMsgText, m.role === "user" && styles.alfabotMsgTextUser]}>
-                      {m.text}
-                    </Text>
-                  </View>
-                ))}
+                {alfabotMessages.map((m, i) =>
+                  m.role === "user" ? (
+                    <View key={`${m.at}_${i}`} style={[styles.alfabotMsg, styles.alfabotMsgUser]}>
+                      <Text style={[styles.alfabotMsgText, styles.alfabotMsgTextUser]}>{m.text}</Text>
+                    </View>
+                  ) : (
+                    <LinearGradient
+                      key={`${m.at}_${i}`}
+                      colors={["#16abc4", "#087ea4"]}
+                      start={{ x: 0, y: 0 }}
+                      end={{ x: 1, y: 1 }}
+                      style={styles.alfabotMsg}
+                    >
+                      <Text style={styles.alfabotMsgText}>{m.text}</Text>
+                    </LinearGradient>
+                  )
+                )}
                 {alfabotLoading ? (
-                  <View style={styles.alfabotMsg}>
+                  <LinearGradient colors={["#16abc4", "#087ea4"]} style={styles.alfabotMsg}>
                     <Text style={styles.alfabotMsgText}>Pensando respuesta...</Text>
-                  </View>
+                  </LinearGradient>
                 ) : null}
               </ScrollView>
 
@@ -13771,7 +14398,7 @@ return disponibles.map((m) => {
                   style={styles.alfabotInput}
                   value={alfabotDraft}
                   onChangeText={setAlfabotDraft}
-                  placeholder="Pregunta sobre gestion operacional o RAC 100"
+                  placeholder="Escribe tu mensaje..."
                   placeholderTextColor="#8a96a3"
                   autoCorrect={false}
                   autoCapitalize="sentences"
@@ -13784,7 +14411,7 @@ return disponibles.map((m) => {
                   onPress={sendAlfabot}
                   disabled={alfabotLoading || !alfabotDraft.trim()}
                 >
-                  <Text style={styles.alfabotSendText}>Enviar</Text>
+                  <Ionicons name="send" size={21} color="#0891b2" />
                 </Pressable>
               </View>
               <Text style={styles.alfabotNote}>Solo temas de operacion y RAC 100.</Text>
@@ -13792,6 +14419,7 @@ return disponibles.map((m) => {
           </KeyboardAvoidingView>
         </View>
       </Modal>
+      </>}
 
 
       </KeyboardAvoidingView>
@@ -14250,13 +14878,14 @@ const styles = StyleSheet.create({
   screenBroadcastCard: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 13,
+    gap: 10,
     backgroundColor: "#ffffff",
     borderWidth: 1,
     borderColor: "#cfe1ec",
-    borderRadius: 18,
-    padding: 16,
-    marginTop: 14,
+    borderRadius: 16,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    marginTop: 10,
     shadowColor: "#0b4164",
     shadowOpacity: 0.07,
     shadowRadius: 12,
@@ -14264,23 +14893,24 @@ const styles = StyleSheet.create({
     elevation: 2,
   },
   screenBroadcastIcon: {
-    width: 50,
-    height: 50,
-    borderRadius: 15,
+    width: 40,
+    height: 40,
+    borderRadius: 12,
     alignItems: "center",
     justifyContent: "center",
     backgroundColor: "#0799c1",
   },
   screenBroadcastTitle: {
-    fontFamily: "Nunito_800ExtraBold",
-    color: "#062d50",
-    fontSize: 17,
+    fontFamily: FONT.semi,
+    color: "#1b2b3a",
+    fontSize: 14,
   },
   screenBroadcastText: {
-    fontFamily: "Nunito_400Regular",
+    fontFamily: FONT.regular,
     color: "#687b8e",
-    fontSize: 13,
-    marginTop: 2,
+    fontSize: 11,
+    lineHeight: 15,
+    marginTop: 1,
   },
   missionPlannerSheetWrap: {
     flex: 1,
@@ -14359,7 +14989,7 @@ const styles = StyleSheet.create({
     height: 132,
     borderRadius: 24,
     overflow: "hidden",
-    backgroundColor: "rgba(255,255,255,0.08)",
+    backgroundColor: "#000000",
     borderWidth: 1,
     borderColor: "rgba(255,255,255,0.15)",
     shadowColor: "#07213f",
@@ -14368,7 +14998,11 @@ const styles = StyleSheet.create({
     shadowOffset: { width: 0, height: 8 },
     elevation: 5,
   },
-  bannerImg: { width: "100%", height: "100%" },
+  bannerImg: {
+    width: "100%",
+    height: "100%",
+    transform: [{ translateX: 12 }],
+  },
   flyNorthBannerCard: {
     backgroundColor: "#ffffff",
     borderColor: "rgba(255,255,255,0.45)",
@@ -14377,6 +15011,7 @@ const styles = StyleSheet.create({
     width: "92%",
     height: "92%",
     alignSelf: "center",
+    transform: [{ translateX: 0 }],
   },
   bannerOverlay: {
     position: "absolute",
@@ -14400,9 +15035,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingVertical: 13,
     marginBottom: 12,
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
+    flexDirection: "column",
+    alignItems: "stretch",
     shadowColor: "#000",
     shadowOpacity: 0.1,
     shadowRadius: 18,
@@ -14427,7 +15061,6 @@ const styles = StyleSheet.create({
   avatarText: { color: "white", fontFamily: FONT.semi, fontSize: 14, lineHeight: 18 },
   userName: { ...TEXT.h3, color: "#1b2b3a", fontFamily: FONT.semi },
   userMeta: { ...TEXT.small, color: "#6b7a8a", marginTop: 2, fontFamily: FONT.regular },
-
   pilotIdCard: {
     marginTop: 10,
     borderRadius: 20,
@@ -14965,14 +15598,39 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontFamily: FONT.regular,
   },
-  airMapTopLeft: {
+  airMapTypeSelector: {
     position: "absolute",
     left: 12,
     top: 12,
-    borderRadius: 12,
+    flexDirection: "row",
+    borderRadius: 14,
+    backgroundColor: "rgba(255,255,255,0.94)",
+    padding: 3,
+    shadowColor: "#0f172a",
+    shadowOpacity: 0.16,
+    shadowRadius: 8,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 4,
+  },
+  airMapTypeOption: {
+    minHeight: 36,
+    paddingHorizontal: 10,
+    borderRadius: 11,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 5,
+  },
+  airMapTypeOptionActive: {
     backgroundColor: "#0ea5e9",
-    paddingHorizontal: 12,
-    paddingVertical: 8,
+  },
+  airMapTypeText: {
+    ...TEXT.small,
+    color: "#334155",
+    fontFamily: FONT.semi,
+  },
+  airMapTypeTextActive: {
+    color: "#ffffff",
   },
   airMapTopRight: {
     position: "absolute",
@@ -14984,11 +15642,6 @@ const styles = StyleSheet.create({
     backgroundColor: "#0ea5e9",
     alignItems: "center",
     justifyContent: "center",
-  },
-  airMapBadgeText: {
-    ...TEXT.small,
-    color: "#ffffff",
-    fontFamily: FONT.semi,
   },
   airConditionsSheet: {
     backgroundColor: "#ffffff",
@@ -15015,6 +15668,33 @@ const styles = StyleSheet.create({
   airSectionEyebrow: {
     ...TEXT.small,
     color: "#475569",
+    fontFamily: FONT.semi,
+  },
+  airConditionsBrandRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 10,
+  },
+  airGoogleWeatherBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 8,
+    paddingVertical: 5,
+    borderRadius: 10,
+    backgroundColor: "#f8fafc",
+    borderWidth: 1,
+    borderColor: "#e2e8f0",
+  },
+  airGoogleWordmark: {
+    fontSize: 14,
+    fontWeight: "700",
+    letterSpacing: -0.7,
+  },
+  airGoogleWeatherLabel: {
+    fontSize: 10,
+    color: "#3c4043",
     fontFamily: FONT.semi,
   },
   airConditionsHeader: {
@@ -15184,6 +15864,45 @@ const styles = StyleSheet.create({
   },
   syncValue: { fontSize: 20, color: "#111918", fontFamily: FONT.extra },
   syncLabel: { ...TEXT.small, color: "#6b7a8a", marginTop: 4, fontFamily: FONT.regular },
+  weatherProviderRow: {
+    marginTop: 8,
+    flexDirection: "row",
+  },
+  googleWeatherBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+    borderRadius: 12,
+    backgroundColor: "#ffffff",
+    borderWidth: 1,
+    borderColor: "#dbe5f0",
+  },
+  googleWordmark: {
+    fontSize: 16,
+    fontWeight: "700",
+    letterSpacing: -0.7,
+  },
+  googleWeatherDivider: {
+    width: 1,
+    height: 17,
+    backgroundColor: "#d7dee8",
+  },
+  googleWeatherText: {
+    ...TEXT.small,
+    color: "#3c4043",
+    fontFamily: FONT.semi,
+  },
+  weatherAttributionRow: {
+    marginTop: 12,
+    gap: 3,
+  },
+  weatherAttributionText: {
+    ...TEXT.small,
+    color: "#64748b",
+    fontFamily: FONT.regular,
+  },
   weatherStateCard: {
     marginTop: 12,
     borderRadius: 16,
@@ -15745,17 +16464,16 @@ const styles = StyleSheet.create({
     elevation: 4,
   },
   flightHeader: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "flex-start",
+    flexDirection: "column",
+    alignItems: "stretch",
     gap: 8,
   },
   flightBadges: {
     flexDirection: "row",
     alignItems: "center",
-    justifyContent: "flex-end",
-    flexShrink: 1,
-    flexWrap: "wrap",
+    justifyContent: "flex-start",
+    width: "100%",
+    flexWrap: "nowrap",
   },
   flightTitle: { ...TEXT.h3, color: "#1b2b3a", fontFamily: FONT.semi },
   flightMeta: { marginTop: 6, ...TEXT.small, color: "#6b7a8a", fontFamily: FONT.regular },
@@ -16116,20 +16834,22 @@ modalOverlayCenter: {
 
 sheetOverlay: {
   flex: 1,
-  backgroundColor: "rgba(0,0,0,0.35)",
-  justifyContent: "flex-end",
-  paddingTop: 96,
-  paddingBottom: 18,
+  backgroundColor: "rgba(0,0,0,0.45)",
+  justifyContent: "center",
+  alignItems: "center",
+  paddingHorizontal: 16,
+  paddingVertical: 24,
 },
 
 sheetCard: {
   backgroundColor: "white",
-  borderTopLeftRadius: 24,
-  borderTopRightRadius: 24,
+  borderRadius: 24,
   padding: 16,
-  paddingBottom: 24,
   width: "100%",
-  maxHeight: "76%",
+  maxWidth: 760,
+  maxHeight: "90%",
+  alignSelf: "center",
+  paddingBottom: 24,
 },
 
 equipoItem: {
@@ -16164,6 +16884,111 @@ modalCardPro: {
   shadowOffset: { width: 0, height: 10 },
   elevation: 8,
 },
+
+companyChecklistIntro: {
+  flexDirection: "row",
+  gap: 12,
+  alignItems: "center",
+  borderRadius: 18,
+  padding: 14,
+  marginBottom: 14,
+  backgroundColor: "#eef9fc",
+  borderWidth: 1,
+  borderColor: "#c9eaf3",
+},
+companyChecklistIntroIcon: {
+  width: 42,
+  height: 42,
+  borderRadius: 14,
+  backgroundColor: "#fff",
+  alignItems: "center",
+  justifyContent: "center",
+},
+companyChecklistIntroTitle: { ...TEXT.body, color: "#17334a", fontFamily: FONT.bold },
+companyChecklistIntroText: { ...TEXT.small, color: "#607489", fontFamily: FONT.regular, marginTop: 3 },
+companyChecklistOpenButton: {
+  minWidth: 160,
+  flexDirection: "row",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: 7,
+  borderColor: "#6dc9df",
+  backgroundColor: "#f2fbfd",
+},
+companyChecklistOpenButtonText: { ...TEXT.small, color: "#057ea8", fontFamily: FONT.bold },
+companyChecklistModalSubtitle: { ...TEXT.small, color: "#6b7a8a", fontFamily: FONT.regular, marginTop: 3 },
+companyChecklistProgressBox: {
+  borderRadius: 14,
+  padding: 12,
+  marginBottom: 10,
+  backgroundColor: "#f3f8fc",
+  borderWidth: 1,
+  borderColor: "#e1eaf2",
+},
+companyChecklistProgressText: { ...TEXT.body, color: "#17334a", fontFamily: FONT.bold },
+companyChecklistProgressHint: { ...TEXT.small, color: "#6b7a8a", fontFamily: FONT.regular, marginTop: 2 },
+companyChecklistQuestion: {
+  borderRadius: 16,
+  padding: 12,
+  marginBottom: 10,
+  backgroundColor: "#fff",
+  borderWidth: 1,
+  borderColor: "#e3eaf1",
+},
+companyChecklistNumber: {
+  width: 26,
+  height: 26,
+  borderRadius: 13,
+  alignItems: "center",
+  justifyContent: "center",
+  backgroundColor: "#e7f6fa",
+  marginBottom: 8,
+},
+companyChecklistNumberText: { ...TEXT.small, color: "#057ea8", fontFamily: FONT.bold },
+companyChecklistQuestionText: { ...TEXT.body, color: "#263849", fontFamily: FONT.regular, lineHeight: 20 },
+companyChecklistAnswers: { flexDirection: "row", gap: 10, marginTop: 12 },
+companyChecklistAnswer: {
+  flex: 1,
+  minHeight: 42,
+  borderRadius: 12,
+  borderWidth: 1,
+  borderColor: "#dce5ed",
+  flexDirection: "row",
+  alignItems: "center",
+  justifyContent: "center",
+  gap: 6,
+  backgroundColor: "#fff",
+},
+companyChecklistAnswerYes: { backgroundColor: "#138a5b", borderColor: "#138a5b" },
+companyChecklistAnswerNo: { backgroundColor: "#c33d4b", borderColor: "#c33d4b" },
+companyChecklistAnswerText: { ...TEXT.body, color: "#526577", fontFamily: FONT.bold },
+companyChecklistAnswerTextActive: { color: "#fff" },
+companyChecklistNotesLabel: { ...TEXT.small, color: "#405467", fontFamily: FONT.bold, marginTop: 4, marginBottom: 6 },
+companyChecklistNotes: { minHeight: 88, textAlignVertical: "top" },
+companyChecklistPhase: {
+  flexDirection: "row",
+  alignItems: "center",
+  gap: 12,
+  borderRadius: 16,
+  padding: 12,
+  marginBottom: 10,
+  borderWidth: 1,
+  borderColor: "#e1e9f0",
+  backgroundColor: "#fff",
+},
+companyChecklistPhaseIcon: {
+  width: 36,
+  height: 36,
+  borderRadius: 12,
+  alignItems: "center",
+  justifyContent: "center",
+  backgroundColor: "#e9f2f8",
+},
+companyChecklistPhaseIconDone: { backgroundColor: "#dff5ea" },
+companyChecklistPhaseIconWarning: { backgroundColor: "#fff0d6" },
+companyChecklistPhaseIconText: { ...TEXT.body, color: "#17334a", fontFamily: FONT.bold },
+companyChecklistPhaseTitle: { ...TEXT.body, color: "#1b2b3a", fontFamily: FONT.bold },
+companyChecklistPhaseMeta: { ...TEXT.small, color: "#718092", fontFamily: FONT.regular, marginTop: 3 },
 
 fratSummaryCard: {
   borderRadius: 18,
@@ -16341,8 +17166,9 @@ fratObservationInput: {
 modalWrap: {
   flex: 1,
   width: "100%",
-  justifyContent: "flex-end",
-  alignItems: "stretch",
+  justifyContent: "center",
+  alignItems: "center",
+  paddingVertical: 20,
 },
 
   iconBtn: {
@@ -16442,14 +17268,13 @@ pickerInput: {
 
   alfabotFab: {
     position: "absolute",
-    right: 20,
-    bottom: 150,
+    right: 10,
+    bottom: 138,
     zIndex: 1200,
-    width: 70,
-    height: 70,
-    borderRadius: 999,
+    width: 82,
+    height: 98,
     alignItems: "center",
-    justifyContent: "center",
+    justifyContent: "flex-end",
   },
   panicFab: {
     position: "absolute",
@@ -16488,15 +17313,9 @@ pickerInput: {
     borderColor: "rgba(59,130,246,0.55)",
   },
   alfabotFabImg: {
-    width: 54,
-    height: 54,
-    borderRadius: 999,
-    resizeMode: "cover",
-    shadowColor: "#1e40af",
-    shadowOpacity: 0.28,
-    shadowRadius: 20,
-    shadowOffset: { width: 0, height: 8 },
-    elevation: 6,
+    width: "100%",
+    height: "100%",
+    resizeMode: "contain",
   },
   alfabotModalWrap: {
     flex: 1,
@@ -16515,18 +17334,17 @@ pickerInput: {
   alfabotCard: {
     width: 360,
     maxWidth: "94%",
-    height: 520,
+    height: 560,
     maxHeight: "85%",
     backgroundColor: "#ffffff",
-    borderWidth: 1,
-    borderColor: "#e5e7eb",
-    borderRadius: 14,
+    borderRadius: 26,
+    padding: 10,
     overflow: "hidden",
     shadowColor: "#020817",
-    shadowOpacity: 0.2,
-    shadowRadius: 24,
-    shadowOffset: { width: 0, height: 12 },
-    elevation: 10,
+    shadowOpacity: 0.28,
+    shadowRadius: 38,
+    shadowOffset: { width: 18, height: 22 },
+    elevation: 14,
   },
   alfabotCardKeyboard: {
     height: 420,
@@ -16536,36 +17354,44 @@ pickerInput: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    borderBottomWidth: 1,
-    borderBottomColor: "#e5e7eb",
+    paddingHorizontal: 8,
+    paddingTop: 4,
+    paddingBottom: 12,
   },
   alfabotHeaderLeft: {
     flexDirection: "row",
     alignItems: "center",
     gap: 10,
   },
-  alfabotAvatar: {
-    width: 38,
-    height: 38,
+  alfabotAvatarShell: {
+    width: 48,
+    height: 48,
     borderRadius: 999,
-    resizeMode: "cover",
+    padding: 4,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  alfabotAvatar: {
+    width: 40,
+    height: 40,
+    resizeMode: "contain",
   },
   alfabotTitle: {
     fontSize: 16,
-    color: "#0f172a",
+    color: "#1e2340",
     fontFamily: FONT.semi,
   },
   alfabotSubtitle: {
     marginTop: 1,
     fontSize: 12,
-    color: "#475569",
+    color: "#a0a4b5",
     fontFamily: FONT.regular,
   },
   alfabotClose: {
     width: 30,
     height: 30,
+    borderRadius: 999,
+    backgroundColor: "#edf9fb",
     alignItems: "center",
     justifyContent: "center",
   },
@@ -16577,59 +17403,73 @@ pickerInput: {
   },
   alfabotBody: {
     flex: 1,
-    backgroundColor: "#f8fbff",
-    padding: 12,
+    backgroundColor: "#ffffff",
+    paddingHorizontal: 14,
+    paddingVertical: 8,
   },
   alfabotBodyContent: {
     paddingBottom: 16,
   },
   alfabotMsg: {
     alignSelf: "flex-start",
-    maxWidth: "90%",
-    paddingVertical: 9,
-    paddingHorizontal: 11,
-    borderRadius: 10,
-    backgroundColor: "#ffffff",
-    borderWidth: 1,
-    borderColor: "#e5e7eb",
-    marginBottom: 8,
+    maxWidth: "88%",
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderTopLeftRadius: 7,
+    borderTopRightRadius: 18,
+    borderBottomLeftRadius: 18,
+    borderBottomRightRadius: 18,
+    marginBottom: 10,
+    shadowColor: "#0891b2",
+    shadowOpacity: 0.16,
+    shadowRadius: 18,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 3,
   },
   alfabotMsgUser: {
     alignSelf: "flex-end",
-    backgroundColor: "#111918",
-    borderColor: "#111918",
+    backgroundColor: "#f0f0f3",
+    borderTopLeftRadius: 18,
+    borderTopRightRadius: 7,
+    shadowOpacity: 0,
+    elevation: 0,
   },
   alfabotMsgText: {
     fontSize: 13,
-    color: "#0f172a",
+    color: "#ffffff",
     fontFamily: FONT.regular,
   },
   alfabotMsgTextUser: {
-    color: "#ffffff",
+    color: "#45485b",
     fontFamily: FONT.regular,
   },
   alfabotForm: {
     flexDirection: "row",
-    gap: 8,
-    padding: 10,
-    borderTopWidth: 1,
-    borderTopColor: "#e5e7eb",
+    alignItems: "center",
+    gap: 6,
+    marginHorizontal: 4,
+    marginTop: 8,
+    marginBottom: 4,
+    paddingHorizontal: 12,
+    paddingVertical: 7,
+    borderWidth: 2,
+    borderColor: "#20a9c4",
+    borderRadius: 15,
+    backgroundColor: "#ffffff",
   },
   alfabotInput: {
     flex: 1,
-    borderWidth: 1,
-    borderColor: "#d1d5db",
-    borderRadius: 10,
-    paddingHorizontal: 10,
+    borderWidth: 0,
+    paddingHorizontal: 2,
     paddingVertical: 10,
     fontSize: 13,
     color: "#1b2b3a",
     fontFamily: FONT.regular,
   },
   alfabotSend: {
-    backgroundColor: "#111918",
-    borderRadius: 10,
-    paddingHorizontal: 12,
+    width: 36,
+    height: 34,
+    borderRadius: 9,
     alignItems: "center",
     justifyContent: "center",
   },
@@ -16642,12 +17482,22 @@ pickerInput: {
     fontSize: 13,
   },
   alfabotNote: {
-    paddingHorizontal: 12,
-    paddingBottom: 10,
-    color: "#64748b",
-    fontSize: 11,
-    fontFamily: FONT.regular,
+    display: "none",
   },
+  pilotDroneportCard: {
+    marginTop: 12,
+    padding: 14,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: "#cfe3ee",
+    backgroundColor: "#f3f9fc",
+  },
+  pilotDroneportTitle: { fontSize: 16, color: "#0d437c", fontFamily: FONT.semi },
+  pilotDroneportSubtitle: { marginTop: 2, fontSize: 12, color: "#60738d", fontFamily: FONT.regular },
+  pilotDroneportApto: { backgroundColor: "#dcfce7" },
+  pilotDroneportWarning: { backgroundColor: "#fff4d6" },
+  pilotDroneportGrid: { marginTop: 12, flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  pilotDroneportValue: { marginTop: 2, color: "#10233f", fontSize: 12, fontFamily: FONT.semi },
 
 
 });

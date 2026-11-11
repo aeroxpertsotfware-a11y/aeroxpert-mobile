@@ -55,7 +55,7 @@ export async function uploadFlightLogsOnline(
     }
 
     try {
-      const response: any = await apiUploadForm("/api/flight-logs/upload", form, { timeoutMs: 30000 });
+      const response: any = await apiUploadForm("/api/flight-logs/upload", form, { timeoutMs: 120000 });
       const alreadyInBitacora = Boolean(response?.duplicate && response?.data?.vueloId);
       results.push({
         id: file.id,

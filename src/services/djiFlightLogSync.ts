@@ -95,6 +95,20 @@ export async function markDJIFlightLogsUploaded(
   return next;
 }
 
+export async function markDJIFlightLogsKnown(
+  files: DJIFlightLogScannedFile[]
+): Promise<DJIDirectSyncSnapshot> {
+  const snapshot = await getDJIDirectSyncSnapshot();
+  const known = new Set(snapshot.knownFingerprints);
+  files.forEach((file) => known.add(file.id));
+  const next: DJIDirectSyncSnapshot = {
+    knownFingerprints: Array.from(known).slice(-MAX_FINGERPRINTS),
+    lastUploads: snapshot.lastUploads,
+  };
+  await AsyncStorage.setItem(SNAPSHOT_KEY, JSON.stringify(next));
+  return next;
+}
+
 export async function getPendingDJIFlightLogs(
   files: DJIFlightLogScannedFile[]
 ): Promise<DJIFlightLogScannedFile[]> {

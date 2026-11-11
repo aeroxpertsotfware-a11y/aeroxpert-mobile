@@ -13,14 +13,18 @@
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true,
+      "icon": "./assets/icon-ios.png",
+      "buildNumber": "6",
+      "bundleIdentifier": "com.aeroxpert.uas",
+      "supportsTablet": false,
       "infoPlist": {
-        "NSAppTransportSecurity": {
-          "NSAllowsArbitraryLoads": true
-        },
+        "ITSAppUsesNonExemptEncryption": false,
         "NSFaceIDUsageDescription": "Usamos Face ID para iniciar sesión de forma segura en la aplicación.",
-        "NSSpeechRecognitionUsageDescription": "Allow $(PRODUCT_NAME) to use speech recognition.",
-        "NSMicrophoneUsageDescription": "Allow $(PRODUCT_NAME) to use the microphone."
+        "NSCameraUsageDescription": "Aeroxpert UAV usa la cámara para escanear códigos QR y adjuntar evidencias operacionales.",
+        "NSPhotoLibraryUsageDescription": "Aeroxpert UAV accede a tus fotos para adjuntar evidencias y documentos operacionales que selecciones.",
+        "NSLocationWhenInUseUsageDescription": "Aeroxpert UAV usa tu ubicación mientras utilizas la aplicación para apoyar la planeación, navegación y registro de operaciones UAS.",
+        "NSSpeechRecognitionUsageDescription": "Aeroxpert UAV usa el reconocimiento de voz para recibir instrucciones de voz dentro de la aplicación.",
+        "NSMicrophoneUsageDescription": "Aeroxpert UAV usa el micrófono para las funciones de voz y audio que actives."
       }
     },
     "android": {
@@ -50,6 +54,7 @@
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
+      "expo-asset",
       "expo-font",
       "expo-audio",
       "expo-camera",

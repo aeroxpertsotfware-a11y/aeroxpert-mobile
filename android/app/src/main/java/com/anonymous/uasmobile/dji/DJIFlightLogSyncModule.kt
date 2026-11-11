@@ -69,13 +69,9 @@ class DJIFlightLogSyncModule(
       sourceApp = "DJI_PILOT_2",
       label = "DJI Pilot / Pilot 2",
       paths = listOf(
-        "DJI/dji.pilot/LOG",
         "DJI/dji.pilot/FlightRecord",
-        "DJI/com.dji.industry.pilot/LOG",
         "DJI/com.dji.industry.pilot/FlightRecord",
-        "Android/data/com.dji.industry.pilot/files/LOG",
         "Android/data/com.dji.industry.pilot/files/FlightRecord",
-        "Android/data/dji.pilot/files/LOG",
         "Android/data/dji.pilot/files/FlightRecord"
       ),
       acceptedMarkers = listOf(
@@ -391,9 +387,10 @@ class DJIFlightLogSyncModule(
     emittedFingerprints: MutableSet<String>
   ) {
     directory.listFiles()?.forEach { file ->
+      if (source.sourceApp == "DJI_PILOT_2" && file.isDirectory) return@forEach
       if (file.isDirectory) {
         scanDirectDirectory(source, file, files, emittedFingerprints)
-      } else if (looksLikeFlightLog(file.name)) {
+      } else if (looksLikeFlightLogForSource(source, file.name)) {
         val fingerprint = buildFingerprint(source.sourceApp, file.absolutePath, file.length(), file.lastModified())
         if (emittedFingerprints.add(fingerprint)) {
           files.pushMap(
@@ -423,11 +420,12 @@ class DJIFlightLogSyncModule(
     emittedFingerprints: MutableSet<String>
   ) {
     directory.listFiles().forEach { child ->
+      if (source.sourceApp == "DJI_PILOT_2" && child.isDirectory) return@forEach
       if (child.isDirectory) {
         scanTreeDirectory(source, child, files, emittedFingerprints)
       } else {
         val name = child.name ?: return@forEach
-        if (!looksLikeFlightLog(name)) return@forEach
+        if (!looksLikeFlightLogForSource(source, name)) return@forEach
 
         val size = child.length()
         val lastModified = child.lastModified()
@@ -462,6 +460,12 @@ class DJIFlightLogSyncModule(
     return lower.contains("flightrecord") || lower.contains("fly") || lower.contains("record")
   }
 
+  private fun looksLikeFlightLogForSource(source: SourceDefinition, fileName: String): Boolean {
+    if (source.sourceApp != "DJI_PILOT_2") return looksLikeFlightLog(fileName)
+    val lower = fileName.lowercase(Locale.US)
+    return lower.startsWith("djiflightrecord_") && lower.endsWith(".txt")
+  }
+
   private fun extensionOf(fileName: String): String {
     val idx = fileName.lastIndexOf('.')
     return if (idx >= 0 && idx < fileName.length - 1) fileName.substring(idx + 1).lowercase(Locale.US) else ""
@@ -478,7 +482,11 @@ class DJIFlightLogSyncModule(
 
   private fun matchesExpectedSource(source: SourceDefinition, value: String): Boolean {
     val lower = value.lowercase(Locale.US)
-    return source.acceptedMarkers.any { marker -> lower.contains(marker.lowercase(Locale.US)) }
+    val decodedLower = Uri.decode(value).lowercase(Locale.US)
+    return source.acceptedMarkers.any { marker ->
+      val normalizedMarker = marker.lowercase(Locale.US)
+      lower.contains(normalizedMarker) || decodedLower.contains(normalizedMarker)
+    }
   }
 
   private fun prefKey(sourceApp: String): String = "tree_uri_$sourceApp"

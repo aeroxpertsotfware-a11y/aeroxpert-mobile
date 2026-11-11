@@ -52,7 +52,7 @@ export async function registerPushToken(jwt: string) {
 
     // 4) registrar en backend
     const resp = await apiPost(
-      "/push/register", // ✅ tu apiPost agrega /api automáticamente
+      "/api/push/register",
       { token: expoToken, platform: Device.osName?.toLowerCase() || "android" },
       jwt
     );

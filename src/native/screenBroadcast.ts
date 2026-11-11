@@ -7,6 +7,8 @@ export type BroadcastDeviceInfo = {
   product: string;
   deviceName: string;
   isRcPlus: boolean;
+  isRcProEnterprise: boolean;
+  isSupportedController: boolean;
   androidApi: number;
 };
 
@@ -22,7 +24,7 @@ const native = NativeModules.ScreenBroadcast;
 
 function requireNative() {
   if (Platform.OS !== "android" || !native) {
-    throw new Error("La transmisión de pantalla requiere la versión Android instalada en un DJI RC Plus.");
+    throw new Error("La transmisión de pantalla requiere la versión Android instalada en un control DJI compatible.");
   }
   return native;
 }

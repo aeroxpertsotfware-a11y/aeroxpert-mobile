@@ -10,20 +10,26 @@ import android.content.pm.ServiceInfo
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.util.DisplayMetrics
+import android.util.Log
+import android.view.WindowManager
 import androidx.core.app.NotificationCompat
 import com.anonymous.uasmobile.MainActivity
 import com.anonymous.uasmobile.R
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.WritableMap
 import com.pedro.common.ConnectChecker
-import com.pedro.encoder.input.sources.audio.NoAudioSource
+import com.pedro.encoder.input.sources.audio.MicrophoneSource
 import com.pedro.encoder.input.sources.video.NoVideoSource
 import com.pedro.encoder.input.sources.video.ScreenSource
 import com.pedro.library.generic.GenericStream
 
 class ScreenBroadcastService : Service(), ConnectChecker {
   companion object {
+    private const val TAG = "ScreenBroadcast"
     private const val CHANNEL_ID = "sgo_screen_broadcast"
     private const val NOTIFICATION_ID = 7315
     private const val ACTION_START = "com.anonymous.uasmobile.stream.START"
@@ -60,13 +66,15 @@ class ScreenBroadcastService : Service(), ConnectChecker {
       putString("state", state)
       putString("detail", detail)
       putDouble("bitrate", bitrate.toDouble())
-      putBoolean("isStreaming", state == "connecting" || state == "live" || state == "reconnecting")
+      putBoolean("isStreaming", state == "live")
       putString("sessionId", activeSessionId)
     }
   }
 
   private var stream: GenericStream? = null
   private var projection: MediaProjection? = null
+  private var projectionCallback: MediaProjection.Callback? = null
+  private var streamPrepared = false
 
   override fun onCreate() {
     super.onCreate()
@@ -78,6 +86,38 @@ class ScreenBroadcastService : Service(), ConnectChecker {
         NotificationManager.IMPORTANCE_LOW
       ))
     }
+    prepareEncoder()
+  }
+
+  @Suppress("DEPRECATION")
+  private fun realDisplaySize(): Pair<Int, Int> {
+    val metrics = DisplayMetrics()
+    val windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+    windowManager.defaultDisplay.getRealMetrics(metrics)
+    return metrics.widthPixels to metrics.heightPixels
+  }
+
+  private fun isRcPlus(): Boolean {
+    val fingerprint = "${Build.MANUFACTURER} ${Build.BRAND} ${Build.MODEL} ${Build.PRODUCT}".lowercase()
+    return fingerprint.contains("dji") &&
+      (fingerprint.contains("rc plus") || fingerprint.contains("rcplus"))
+  }
+
+  private fun prepareEncoder() {
+    val (displayWidth, displayHeight) = realDisplaySize()
+    val rcPlus = isRcPlus()
+    val landscape = rcPlus || displayWidth >= displayHeight
+    val width = if (landscape) 960 else 360
+    val height = if (landscape) 600 else 640
+    Log.i(TAG, "Preparing encoder ${width}x${height}; display=${displayWidth}x${displayHeight}; rcPlus=$rcPlus")
+    stream = GenericStream(applicationContext, this, NoVideoSource(), MicrophoneSource()).apply {
+      getGlInterface().setForceRender(true, 15)
+      streamPrepared = prepareVideo(width, height, 1_500_000, fps = 15, iFrameInterval = 2, rotation = 0) &&
+        prepareAudio(32000, true, 128000, echoCanceler = true, noiseSuppressor = true)
+      getGlInterface().setCameraOrientation(0)
+      getStreamClient().setReTries(20)
+    }
+    Log.i(TAG, "Encoder prepared=$streamPrepared")
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -85,7 +125,7 @@ class ScreenBroadcastService : Service(), ConnectChecker {
       ACTION_STOP -> stopBroadcast()
       ACTION_START -> startBroadcast(intent)
     }
-    return START_NOT_STICKY
+    return START_STICKY
   }
 
   @Suppress("DEPRECATION")
@@ -105,25 +145,27 @@ class ScreenBroadcastService : Service(), ConnectChecker {
       return
     }
     try {
-      stream?.release()
+      if (!streamPrepared || stream == null) error("Screen encoder unavailable")
+      if (stream?.isStreaming == true) stream?.stopStream()
+      projectionCallback?.let { callback -> projection?.unregisterCallback(callback) }
       projection?.stop()
       val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
       projection = manager.getMediaProjection(resultCode, data)
       val currentProjection = projection ?: error("Android no permitió capturar la pantalla.")
-      val display = resources.displayMetrics
-      val landscape = display.widthPixels >= display.heightPixels
-      val width = if (landscape) 1280 else 720
-      val height = if (landscape) 720 else 1280
-      val rotation = 0
-      stream = GenericStream(applicationContext, this, NoVideoSource(), NoAudioSource()).apply {
-        getGlInterface().setForceRender(true, 24)
-        if (!prepareVideo(width, height, 3_500_000, fps = 24, iFrameInterval = 2, rotation = rotation)) {
-          error("El codificador de video del control no está disponible.")
+      projectionCallback = object : MediaProjection.Callback() {
+        override fun onStop() {
+          Log.e(TAG, "MediaProjection stopped by Android")
+          if (state != "stopping" && state != "idle") {
+            state = "error"
+            detail = "Android detuvo la captura de pantalla"
+          }
         }
-        changeVideoSource(ScreenSource(applicationContext, currentProjection))
-        getStreamClient().setReTries(20)
-        startStream(url)
       }
+      currentProjection.registerCallback(projectionCallback!!, Handler(Looper.getMainLooper()))
+      Log.i(TAG, "Changing video source to MediaProjection")
+      stream?.changeVideoSource(ScreenSource(applicationContext, currentProjection))
+      Log.i(TAG, "Starting RTMP stream")
+      stream?.startStream(url)
       state = "connecting"
       detail = "Conectando con S-GO"
     } catch (error: Throwable) {
@@ -149,7 +191,10 @@ class ScreenBroadcastService : Service(), ConnectChecker {
       .addAction(0, "Detener", stopIntent)
       .build()
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-      startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+      val serviceTypes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+      } else ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+      startForeground(NOTIFICATION_ID, notification, serviceTypes)
     } else startForeground(NOTIFICATION_ID, notification)
   }
 
@@ -158,8 +203,11 @@ class ScreenBroadcastService : Service(), ConnectChecker {
     stream?.stopStream()
     stream?.release()
     stream = null
+    streamPrepared = false
+    projectionCallback?.let { callback -> projection?.unregisterCallback(callback) }
     projection?.stop()
     projection = null
+    projectionCallback = null
     state = "idle"
     detail = ""
     bitrate = 0
@@ -169,6 +217,7 @@ class ScreenBroadcastService : Service(), ConnectChecker {
   }
 
   private fun fail(message: String) {
+    Log.e(TAG, message)
     state = "error"
     detail = message
     stopForeground(STOP_FOREGROUND_REMOVE)
@@ -176,18 +225,34 @@ class ScreenBroadcastService : Service(), ConnectChecker {
   }
 
   override fun onDestroy() {
+    if (stream?.isStreaming == true) stream?.stopStream()
     stream?.release()
+    projectionCallback?.let { callback -> projection?.unregisterCallback(callback) }
     projection?.stop()
     stream = null
     projection = null
+    projectionCallback = null
+    streamPrepared = false
     super.onDestroy()
   }
 
   override fun onBind(intent: Intent?): IBinder? = null
-  override fun onConnectionStarted(url: String) { state = "connecting" }
-  override fun onConnectionSuccess() { state = "live"; detail = "Pantalla en vivo" }
-  override fun onNewBitrate(value: Long) { bitrate = value }
+  override fun onConnectionStarted(url: String) { state = "connecting"; Log.i(TAG, "RTMP connection started") }
+  override fun onConnectionSuccess() {
+    Log.i(TAG, "RTMP connected; waiting for encoded frames")
+    state = "connecting"
+    detail = "Servidor conectado; esperando video"
+  }
+  override fun onNewBitrate(value: Long) {
+    Log.i(TAG, "RTMP bitrate=$value")
+    bitrate = value
+    if (value > 0L) {
+      state = "live"
+      detail = "Pantalla en vivo"
+    }
+  }
   override fun onConnectionFailed(reason: String) {
+    Log.e(TAG, "RTMP connection failed: $reason")
     state = "reconnecting"
     detail = reason
     stream?.getStreamClient()?.reTry(1500, reason, null)

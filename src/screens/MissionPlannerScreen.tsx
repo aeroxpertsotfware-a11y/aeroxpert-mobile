@@ -15,7 +15,7 @@ import {
 import { Ionicons } from "@expo/vector-icons";
 import { DateTimePickerAndroid } from "@react-native-community/datetimepicker";
 import * as DocumentPicker from "expo-document-picker";
-import { WebView } from "react-native-webview";
+import MapView, { Marker, Polygon, PROVIDER_GOOGLE } from "react-native-maps";
 import { API_URL } from "../config/api";
 
 type Props = {
@@ -230,11 +230,8 @@ export default function MissionPlannerScreen({ onClose, onCreated, token }: Prop
   const [areaPoints, setAreaPoints] = useState<GeoPoint[]>([]);
   const [mapKey, setMapKey] = useState(0);
   const [kmlFile, setKmlFile] = useState<PickedFile | null>(null);
-  const areaMapRef = useRef<WebView>(null);
+  const areaMapRef = useRef<MapView>(null);
   const formScrollRef = useRef<ScrollView>(null);
-  // Mantiene viva la instancia de ArcGIS mientras Sketch reporta cambios.
-  // mapKey solo cambia cuando el usuario solicita reiniciar el mapa.
-  const areaMapHtml = useMemo(() => buildArcGisAreaMapHtml(areaPoints), [mapKey]);
 
   const pickTime = useCallback((current: string, onSelect: (value: string) => void) => {
     const [hours, minutes] = /^\d{2}:\d{2}$/.test(current)
@@ -652,12 +649,18 @@ export default function MissionPlannerScreen({ onClose, onCreated, token }: Prop
 
         {step === 6 && <Card>
           <Text style={styles.areaTitle}>Área de operación</Text><Text style={styles.helperLeft}>Toca el mapa para delimitar la zona.</Text>
-          <View style={styles.mapWrap}><WebView ref={areaMapRef} key={mapKey} originWhitelist={["*"]} source={{ html: areaMapHtml }} javaScriptEnabled domStorageEnabled mixedContentMode="compatibility" nestedScrollEnabled onMessage={(event) => {
-            try { const data = JSON.parse(event.nativeEvent.data); if (data?.type === "points" && Array.isArray(data.points)) setAreaPoints(data.points); } catch {}
-          }} /></View>
+          <View style={styles.mapWrap}>
+            <MapView ref={areaMapRef} key={mapKey} style={StyleSheet.absoluteFillObject} provider={PROVIDER_GOOGLE} mapType="hybrid"
+              initialRegion={{ latitude: areaPoints[0]?.[0] ?? 4.65, longitude: areaPoints[0]?.[1] ?? -74.1, latitudeDelta: areaPoints.length ? 0.025 : 5, longitudeDelta: areaPoints.length ? 0.025 : 5 }}
+              onPress={(event) => { const { latitude, longitude } = event.nativeEvent.coordinate; setAreaPoints((current) => [...current, [latitude, longitude]]); }}>
+              {areaPoints.length >= 2 && <Polygon coordinates={areaPoints.map(([latitude, longitude]) => ({ latitude, longitude }))} strokeColor="#2563eb" strokeWidth={3} fillColor="rgba(37,99,235,.25)" />}
+              {areaPoints.map(([latitude, longitude], index) => <Marker key={`vertex-${index}`} coordinate={{ latitude, longitude }} draggable pinColor={index === 0 ? "#16a34a" : "#2563eb"} title={index === 0 ? "Primer punto" : `Vértice ${index + 1}`}
+                onDragEnd={(event) => setAreaPoints((current) => current.map((point, pointIndex) => pointIndex === index ? [event.nativeEvent.coordinate.latitude, event.nativeEvent.coordinate.longitude] : point))} />)}
+            </MapView>
+          </View>
           <View style={styles.mapActions}>
-            <Pressable style={styles.primaryButton} onPress={() => areaMapRef.current?.injectJavaScript("window.startPolygon&&window.startPolygon();true;")}><Ionicons name="pencil-outline" size={17} color="#fff" /><Text style={styles.primaryText}>Dibujar polígono</Text></Pressable>
-            <Pressable style={styles.outlineButton} onPress={() => { areaMapRef.current?.injectJavaScript("window.clearPolygon&&window.clearPolygon();true;"); setAreaPoints([]); }}><Ionicons name="trash-outline" size={17} color="#111918" /><Text style={styles.outlineText}>Limpiar</Text></Pressable>
+            <Pressable style={styles.primaryButton} onPress={() => { setAreaPoints([]); setMapKey((value) => value + 1); }}><Ionicons name="pencil-outline" size={17} color="#fff" /><Text style={styles.primaryText}>Nuevo polígono</Text></Pressable>
+            <Pressable style={styles.outlineButton} onPress={() => { setAreaPoints([]); setMapKey((value) => value + 1); }}><Ionicons name="trash-outline" size={17} color="#111918" /><Text style={styles.outlineText}>Limpiar</Text></Pressable>
             <Pressable style={styles.outlineButton} onPress={async () => setKmlFile((await pickDocuments(false, ["application/vnd.google-earth.kml+xml", "application/vnd.google-earth.kmz", "*/*"]))[0] || null)}><Ionicons name="document-attach-outline" size={17} color="#111918" /><Text style={styles.outlineText}>Subir KML/KMZ</Text></Pressable>
           </View>
           <Text style={styles.helperLeft}>{areaPoints.length} vértices {kmlFile ? `· ${kmlFile.name}` : ""}</Text>

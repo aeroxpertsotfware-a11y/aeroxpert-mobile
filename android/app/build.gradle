@@ -1,7 +1,6 @@
 apply plugin: "com.android.application"
 apply plugin: "org.jetbrains.kotlin.android"
 apply plugin: "com.facebook.react"
-
 def projectRoot = rootDir.getAbsoluteFile().getParentFile().getAbsolutePath()
 
 /**
@@ -97,7 +96,8 @@ android {
 
         buildConfigField "String", "REACT_NATIVE_RELEASE_LEVEL", "\"${findProperty('reactNativeReleaseLevel') ?: 'stable'}\""
         manifestPlaceholders = [
-            DJI_API_KEY: findProperty("DJI_API_KEY") ?: System.getenv("DJI_API_KEY") ?: ""
+            DJI_API_KEY: findProperty("DJI_API_KEY") ?: System.getenv("DJI_API_KEY") ?: "",
+            GOOGLE_MAPS_API_KEY: (findProperty("GOOGLE_MAPS_ANDROID_API_KEY") ?: System.getenv("GOOGLE_MAPS_ANDROID_API_KEY") ?: findProperty("GOOGLE_MAPS_API_KEY") ?: System.getenv("GOOGLE_MAPS_API_KEY") ?: "").toString().trim()
         ]
     }
     signingConfigs {
@@ -186,5 +186,6 @@ dependencies {
         implementation jscFlavor
     }
 }
+
 
 apply plugin: 'com.google.gms.google-services'

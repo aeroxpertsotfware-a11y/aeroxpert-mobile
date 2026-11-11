@@ -38,6 +38,8 @@ class ScreenBroadcastModule(private val reactContext: ReactApplicationContext) :
     val fingerprint = "$manufacturer $brand $model $product".lowercase()
     val isRcPlus = fingerprint.contains("dji") &&
       (fingerprint.contains("rc plus") || fingerprint.contains("rcplus"))
+    val isRcProEnterprise = fingerprint.contains("rm510b") ||
+      (fingerprint.contains("dji") && fingerprint.contains("rc pro enterprise"))
     promise.resolve(Arguments.createMap().apply {
       putString("manufacturer", manufacturer)
       putString("brand", brand)
@@ -45,6 +47,8 @@ class ScreenBroadcastModule(private val reactContext: ReactApplicationContext) :
       putString("product", product)
       putString("deviceName", Build.DEVICE.orEmpty())
       putBoolean("isRcPlus", isRcPlus)
+      putBoolean("isRcProEnterprise", isRcProEnterprise)
+      putBoolean("isSupportedController", isRcPlus || isRcProEnterprise)
       putInt("androidApi", Build.VERSION.SDK_INT)
     })
   }

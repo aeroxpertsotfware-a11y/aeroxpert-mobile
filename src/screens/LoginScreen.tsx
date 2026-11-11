@@ -110,9 +110,9 @@ const ENABLE_FACE_VERIFY = false;
   const [loading, setLoading] = useState(false);
 
   // ✅ Vista tipo “Welcome + Login” como la referencia
-  const [view, setView] = useState<"welcome" | "login">("welcome");
 
   const [showPass, setShowPass] = useState(false);
+  const [rememberMe, setRememberMe] = useState(true);
   const [focusUser, setFocusUser] = useState(false);
   const [focusPass, setFocusPass] = useState(false);
   const [forgotVisible, setForgotVisible] = useState(false);
@@ -308,7 +308,6 @@ const ENABLE_FACE_VERIFY = false;
             onPress: () => {
               resetForgotPasswordState(false);
               setPassword("");
-              setView("login");
             },
           },
         ]);
@@ -440,6 +439,7 @@ const ENABLE_FACE_VERIFY = false;
       const res = await withTimeout(
         fetch(url, {
           method: "POST",
+          credentials: "include",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             documento: usuario.trim(),
@@ -545,9 +545,13 @@ const ENABLE_FACE_VERIFY = false;
         await SecureStore.setItemAsync(SECURE_TOKEN_KEY, token, {
           keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
         });
-        await SecureStore.setItemAsync(SECURE_DOC_KEY, documento, {
-          keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
-        });
+        if (rememberMe) {
+          await SecureStore.setItemAsync(SECURE_DOC_KEY, documento, {
+            keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+          });
+        } else {
+          await SecureStore.deleteItemAsync(SECURE_DOC_KEY);
+        }
         setHasSavedToken(true);
 
 
@@ -633,16 +637,17 @@ const ENABLE_FACE_VERIFY = false;
         return;
       }
 
-      const token = await SecureStore.getItemAsync(SECURE_TOKEN_KEY);
+      const savedToken = await SecureStore.getItemAsync(SECURE_TOKEN_KEY);
       const doc = await SecureStore.getItemAsync(SECURE_DOC_KEY);
 
-      if (!token || !doc) {
+      if (!savedToken || !doc) {
         Alert.alert(
           "Biometría",
           "Primero inicia sesión una vez para activar biometría."
         );
         return;
       }
+      let token: string = savedToken;
 
       const result = await LocalAuthentication.authenticateAsync({
         promptMessage: `Ingresar con ${bioTypeLabel}`,
@@ -656,8 +661,53 @@ const ENABLE_FACE_VERIFY = false;
         setLoading(true);
         await sleep(MIN_LOADING_MS_BIO);
 
+        const online = await isOnline();
+        if (online) {
+          // Face ID desbloquea las credenciales locales, pero no convierte un
+          // JWT vencido en una sesión válida. Primero comprobamos el token y,
+          // si expiró, pedimos uno nuevo usando la sesión segura del servidor.
+          const meResponse = await withTimeout(
+            fetch(apiPath("me"), {
+              headers: { Authorization: `Bearer ${token}` },
+            }),
+            12000
+          ).catch(() => null);
+
+          if (!meResponse?.ok) {
+            const refreshResponse = await withTimeout(
+              fetch(apiPath("auth/refresh"), {
+                method: "POST",
+                credentials: "include",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({}),
+              }),
+              12000
+            ).catch(() => null);
+
+            const refreshRaw = refreshResponse ? await refreshResponse.text() : "";
+            let refreshData: any = {};
+            try {
+              refreshData = refreshRaw ? JSON.parse(refreshRaw) : {};
+            } catch {}
+
+            if (!refreshResponse?.ok || !refreshData?.token) {
+              await SecureStore.deleteItemAsync(SECURE_TOKEN_KEY);
+              setHasSavedToken(false);
+              Alert.alert(
+                "Sesión vencida",
+                "Por seguridad, ingresa una vez con tu contraseña para renovar el acceso con Face ID."
+              );
+              return;
+            }
+
+            token = refreshData.token;
+            await SecureStore.setItemAsync(SECURE_TOKEN_KEY, token, {
+              keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+            });
+          }
+        }
+
         if (ENABLE_FACE_VERIFY) {
-          const online = await isOnline();
           if (online) {
             const faceOk = await verifyFaceWithBackend(token, doc);
             if (!faceOk) return;
@@ -685,12 +735,12 @@ const ENABLE_FACE_VERIFY = false;
 
         {/* ✅ IMAGEN DE FONDO + DEGRADADO (reemplaza el video) */}
         <ImageBackground
-          source={require("../../assets/login-hero.png")} // <-- Cambia por tu imagen
+          source={require("../../assets/login.png")}
           style={StyleSheet.absoluteFill}
           resizeMode="cover"
         >
           <LinearGradient
-            colors={["rgba(0,0,0,0.05)", "rgba(0,0,0,0.55)", "rgba(0,0,0,0.92)"]}
+            colors={["rgba(0,8,20,0.02)", "rgba(0,8,20,0.18)", "rgba(0,8,20,0.82)"]}
             style={StyleSheet.absoluteFill}
           />
         </ImageBackground>
@@ -700,83 +750,18 @@ const ENABLE_FACE_VERIFY = false;
             style={{ flex: 1 }}
             behavior={Platform.OS === "ios" ? "padding" : undefined}
           >
-            {/* ===== WELCOME (como la referencia) ===== */}
-            {view === "welcome" ? (
-              <View style={styles.welcomeWrap}>
-                <View style={styles.welcomeCenter}>
-                  <View style={styles.brandRow}>
-                    <View style={styles.brandDot} />
-                    <Text style={styles.brandMini}>AeroXpert UAV Logs</Text>
-                  </View>
-
-                  <Text style={styles.welcomeTitle}>
-                    Welcome to the{"\n"}Dronelogbook
-                  </Text>
-
-                  <Text style={styles.welcomeSub}>
-                    Bitácoras, mantenimiento y reportes SMS en un solo lugar.
-                  </Text>
-                </View>
-
-                <View style={styles.welcomeActions}>
-                
-                  <Pressable
-                    style={({ pressed }) => [
-                      styles.welcomeSecondary,
-                      pressed && { transform: [{ scale: 0.99 }] },
-                      loading && { opacity: 0.7 },
-                    ]}
-                    disabled={loading}
-                    onPress={() => setView("login")}
-                  >
-                    <Text style={styles.welcomeSecondaryText}>Login</Text>
-                  </Pressable>
-
-                  <Text style={styles.version}>Versión 1.0.0</Text>
-                </View>
-              </View>
-            ) : (
-              /* ===== LOGIN FORM (tu login actual) ===== */
               <ScrollView
                 contentContainerStyle={styles.scroll}
                 keyboardShouldPersistTaps="handled"
               >
-                <View style={styles.topRow}>
-                  <Pressable
-                    onPress={() => setView("welcome")}
-                    style={styles.backBtn}
-                    disabled={loading}
-                    hitSlop={10}
-                  >
-                    <Ionicons name="chevron-back" size={22} color="#fff" />
-                    <Text style={styles.backText}>Volver</Text>
-                  </Pressable>
-                </View>
-
-                <View style={styles.hero}>
-                  <Text style={styles.brand}></Text>
-
-                  <View style={styles.heroStats}>
-                    <Text style={styles.heroStat}>
-                      Seguro{"\n"}
-                      <Text style={styles.heroStatSub}>login cifrado</Text>
-                    </Text>
-                    <Text style={styles.heroStat}>
-                      Soporte{"\n"}
-                      <Text style={styles.heroStatSub}>24/7</Text>
-                    </Text>
-                  </View>
-                </View>
-
                 <View style={styles.card}>
-                  <Text style={styles.label}>Cédula</Text>
                   <View
                     style={[styles.inputWrap, focusUser && styles.inputWrapFocus]}
                   >
                     <TextInput
                       style={styles.input}
-                      placeholder="Número de cédula"
-                      placeholderTextColor="rgba(255,255,255,0.55)"
+                      placeholder="Cédula"
+                      placeholderTextColor="rgba(255,255,255,0.62)"
                       keyboardType="numeric"
                       value={usuario}
                       onChangeText={setUsuario}
@@ -787,14 +772,13 @@ const ENABLE_FACE_VERIFY = false;
                     />
                   </View>
 
-                  <Text style={styles.label}>Contraseña</Text>
                   <View
                     style={[styles.inputWrap, focusPass && styles.inputWrapFocus]}
                   >
                     <TextInput
                       style={styles.input}
-                      placeholder="••••••••"
-                      placeholderTextColor="rgba(255,255,255,0.55)"
+                      placeholder="Contraseña"
+                      placeholderTextColor="rgba(255,255,255,0.62)"
                       value={password}
                       onChangeText={setPassword}
                       secureTextEntry={!showPass}
@@ -813,39 +797,47 @@ const ENABLE_FACE_VERIFY = false;
                       <Ionicons
                         name={showPass ? "eye-off-outline" : "eye-outline"}
                         size={20}
-                        color="rgba(255,255,255,0.85)"
+                        color="rgba(255,255,255,0.78)"
                       />
                     </Pressable>
                   </View>
 
-                  <Pressable
-                    onPress={() => (openForgotPassword(),
-                        "Recuperación",
-                        "Aquí conectamos recuperar contraseña después."
-                      )
-                    }
-                    style={styles.forgotBtn}
-                    disabled={loading}
-                  >
-                    <Text style={styles.forgotText}>¿Olvidaste la contraseña?</Text>
-                  </Pressable>
+                  <View style={styles.loginOptionsRow}>
+                    <Pressable
+                      style={styles.rememberBtn}
+                      onPress={() => setRememberMe((value) => !value)}
+                      disabled={loading}
+                    >
+                      <View style={[styles.rememberCircle, rememberMe && styles.rememberCircleOn]}>
+                        {rememberMe && <View style={styles.rememberDot} />}
+                      </View>
+                      <Text style={styles.rememberText}>Recordarme</Text>
+                    </Pressable>
+
+                    <Pressable onPress={openForgotPassword} style={styles.forgotBtn} disabled={loading}>
+                      <Text style={styles.forgotText}>¿Olvidaste tu contraseña?</Text>
+                    </Pressable>
+                  </View>
 
                   <Pressable
                     style={({ pressed }) => [
                       styles.primaryBtn,
+                      canSubmit ? styles.primaryBtnEnabled : styles.primaryBtnDisabled,
                       pressed && canSubmit && { transform: [{ scale: 0.99 }] },
-                      !canSubmit && { opacity: 0.6 },
                     ]}
                     onPress={handleLogin}
                     disabled={!canSubmit}
                   >
                     <View style={styles.primaryRow}>
-                      <Text style={styles.primaryText}>Iniciar sesión</Text>
-                      <View style={styles.arrowCircle}>
-                        <Ionicons name="arrow-forward" size={18} color="#0b2a17" />
-                      </View>
+                      <Text style={[styles.primaryText, !canSubmit && styles.primaryTextDisabled]}>Iniciar sesión</Text>
                     </View>
                   </Pressable>
+
+                  <View style={styles.orRow}>
+                    <View style={styles.orLine} />
+                    <Text style={styles.orText}>O</Text>
+                    <View style={styles.orLine} />
+                  </View>
 
                   {showBiometrics ? (
                     <Pressable
@@ -881,7 +873,7 @@ const ENABLE_FACE_VERIFY = false;
                       <MaterialCommunityIcons
                         name="information-outline"
                         size={16}
-                        color="rgba(255,255,255,0.85)"
+                        color="#69717c"
                       />
                       <Text style={styles.hintText}>
                         Face ID no está disponible en Expo Go (iPhone). Funcionará
@@ -893,7 +885,6 @@ const ENABLE_FACE_VERIFY = false;
 
                 <Text style={styles.version}>Versión 1.0.0</Text>
               </ScrollView>
-            )}
 
             {/* ✅ OVERLAY MINIMALISTA */}
             <Modal
@@ -1150,9 +1141,10 @@ const styles = StyleSheet.create({
   scroll: {
     flexGrow: 1,
     paddingHorizontal: 18,
-    paddingTop: 10,
-    paddingBottom: 24,
-    justifyContent: "center",
+    paddingTop: 190,
+    paddingBottom: 122,
+    justifyContent: "flex-end",
+    alignItems: "center",
   },
   topRow: { marginBottom: 6 },
   backBtn: {
@@ -1192,11 +1184,13 @@ const styles = StyleSheet.create({
   heroStatSub: { color: "rgba(255,255,255,0.78)", fontSize: 12, fontFamily: FONT.semibold },
 
   card: {
+    width: "100%",
+    maxWidth: 480,
     borderRadius: 22,
     padding: 16,
     borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.16)",
-    backgroundColor: "rgba(10,12,16,0.55)",
+    borderColor: "rgba(255,255,255,0.20)",
+    backgroundColor: "rgba(2,12,26,0.58)",
     shadowColor: "#000",
     shadowOpacity: 0.25,
     shadowRadius: 18,
@@ -1212,25 +1206,44 @@ const styles = StyleSheet.create({
   },
 
   inputWrap: {
-    marginTop: 8,
-    borderRadius: 16,
+    marginTop: 10,
+    borderRadius: 24,
     paddingHorizontal: 14,
-    paddingVertical: 14,
+    minHeight: 48,
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "rgba(255,255,255,0.10)",
-    borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.16)",
+    backgroundColor: "rgba(255,255,255,0.13)",
+    borderWidth: 1.5,
+    borderColor: "rgba(255,255,255,0.18)",
   },
   inputWrapFocus: {
-    backgroundColor: "rgba(255,255,255,0.14)",
-    borderColor: "rgba(255,255,255,0.30)",
+    backgroundColor: "rgba(255,255,255,0.19)",
+    borderColor: "rgba(114,178,255,0.90)",
   },
-  input: { flex: 1, color: "#fff", fontSize: 16, fontFamily: FONT.regular },
+  input: { flex: 1, color: "#ffffff", fontSize: 15, fontFamily: FONT.regular, paddingVertical: 0 },
   eyeBtn: { paddingLeft: 10 },
 
-  forgotBtn: { alignSelf: "flex-end", marginTop: 10 },
-  forgotText: { color: "rgba(255,255,255,0.85)", fontFamily: FONT.bold },
+  loginOptionsRow: {
+    marginTop: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  rememberBtn: { flexDirection: "row", alignItems: "center", gap: 7 },
+  rememberCircle: {
+    width: 15,
+    height: 15,
+    borderRadius: 8,
+    borderWidth: 1.5,
+    borderColor: "#4bb8ff",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  rememberCircleOn: { borderColor: "#4bb8ff" },
+  rememberDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: "#4bb8ff" },
+  rememberText: { color: "rgba(255,255,255,0.82)", fontFamily: FONT.semibold, fontSize: 12 },
+  forgotBtn: { paddingVertical: 4 },
+  forgotText: { color: "rgba(255,255,255,0.82)", fontFamily: FONT.semibold, fontSize: 12 },
   forgotOverlay: {
     flex: 1,
     backgroundColor: "rgba(0,0,0,0.72)",
@@ -1297,13 +1310,25 @@ const styles = StyleSheet.create({
 
   primaryBtn: {
     marginTop: 14,
-    backgroundColor: "rgb(58, 125, 226)",
-    borderRadius: 22,
-    paddingVertical: 14,
+    borderRadius: 24,
+    paddingVertical: 13,
     paddingHorizontal: 16,
+    borderWidth: 1.5,
   },
-  primaryRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
-  primaryText: { color: "#080808", fontFamily: FONT.black, fontSize: 16 },
+  primaryBtnEnabled: {
+    backgroundColor: "#168fd1",
+    borderColor: "#58c7ff",
+  },
+  primaryBtnDisabled: {
+    backgroundColor: "rgba(12, 93, 153, 0.38)",
+    borderColor: "rgba(88, 199, 255, 0.72)",
+  },
+  primaryRow: { flexDirection: "row", alignItems: "center", justifyContent: "center" },
+  primaryText: { color: "#ffffff", fontFamily: FONT.bold, fontSize: 16 },
+  primaryTextDisabled: { color: "#c6ebff" },
+  orRow: { flexDirection: "row", alignItems: "center", marginTop: 12, marginBottom: 2 },
+  orLine: { flex: 1, height: 1, backgroundColor: "rgba(255,255,255,0.28)" },
+  orText: { marginHorizontal: 10, color: "#8db8ff", fontFamily: FONT.bold, fontSize: 11 },
 
   arrowCircle: {
     width: 30,
@@ -1320,8 +1345,8 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
     paddingHorizontal: 16,
     borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.18)",
-    backgroundColor: "rgba(255,255,255,0.10)",
+    borderColor: "#d9dce3",
+    backgroundColor: "#232b38",
   },
   bioRow: { flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 10 },
   bioText: { color: "#fff", fontFamily: FONT.extrabold, fontSize: 14 },
@@ -1332,15 +1357,15 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     paddingHorizontal: 12,
     borderWidth: 1,
-    borderColor: "rgba(255,255,255,0.16)",
-    backgroundColor: "rgba(255,255,255,0.08)",
+    borderColor: "#e1e3e8",
+    backgroundColor: "#f5f6f8",
     flexDirection: "row",
     alignItems: "center",
     gap: 8,
   },
   hintText: {
     flex: 1,
-    color: "rgba(255,255,255,0.85)",
+    color: "#69717c",
     fontFamily: FONT.semibold,
     fontSize: 12,
     lineHeight: 16,
