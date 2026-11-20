@@ -293,6 +293,10 @@ type Reporte = {
 type DjiCloudStatus = {
   ok: boolean;
   connected: boolean;
+  syncSource?: "company" | "personal";
+  companyAccountAvailable?: boolean;
+  companyAccountIdentifier?: string;
+  personalAccountConnected?: boolean;
   sourceApp: "DJI_FLY" | "DJI_GO_4" | "DJI_PILOT_2";
   integrationMode?: "consumer_local" | "enterprise_cloud";
   accountIdentifier: string;
@@ -3317,7 +3321,7 @@ const removeEvidence = useCallback((id: string) => {
   const loadDjiCloudStatus = useCallback(async () => {
     try {
       setDjiCloudLoading(true);
-      const response = await apiFetch<DjiCloudStatus>("/api/dji-cloud/status");
+      const response = await apiFetch<DjiCloudStatus>("/api/dji-smartfarm/pilot/status");
       setDjiCloudStatus(response);
       if (response?.sourceApp) setFlightLogSourceApp(response.sourceApp);
       setDjiIntegrationMode("consumer_local");
@@ -3340,7 +3344,7 @@ const removeEvidence = useCallback((id: string) => {
 
   const loadDjiCloudFlights = useCallback(async () => {
     try {
-      const response = await apiFetch<{ ok: boolean; items?: DjiCloudFlight[] }>("/api/dji-cloud/flights");
+      const response = await apiFetch<{ ok: boolean; items?: DjiCloudFlight[] }>("/api/dji-smartfarm/pilot/flights");
       setDjiCloudFlights(Array.isArray(response?.items) ? response.items : []);
     } catch {
       setDjiCloudFlights([]);
@@ -3389,6 +3393,22 @@ const removeEvidence = useCallback((id: string) => {
     []
   );
 
+  const saveDjiSyncSource = useCallback(async (syncSource: "company" | "personal") => {
+    try {
+      setDjiCloudSaving(true);
+      const response = await apiFetch<DjiCloudStatus & { message?: string }>("/api/dji-smartfarm/pilot/source", {
+        method: "POST",
+        body: JSON.stringify({ syncSource }),
+      });
+      setDjiCloudStatus(response);
+      Toast.show({ type: "success", text1: "Sincronización DJI", text2: response?.message || "Fuente actualizada." });
+    } catch (e: any) {
+      Toast.show({ type: "error", text1: "Sincronización DJI", text2: e?.message || "No se pudo cambiar la fuente." });
+    } finally {
+      setDjiCloudSaving(false);
+    }
+  }, []);
+
   const openDjiCloudModal = useCallback(() => {
     setDjiCloudForm({
       accountIdentifier: djiCloudStatus?.accountIdentifier || "",
@@ -3436,7 +3456,7 @@ const removeEvidence = useCallback((id: string) => {
 
     try {
       setDjiCloudSaving(true);
-      const response = await apiFetch<DjiCloudStatus & { message?: string }>("/api/dji-cloud/connect", {
+      const response = await apiFetch<DjiCloudStatus & { message?: string }>("/api/dji-smartfarm/pilot/connect", {
         method: "POST",
         body: JSON.stringify({
           accountIdentifier: djiCloudForm.accountIdentifier.trim(),
@@ -3477,7 +3497,7 @@ const removeEvidence = useCallback((id: string) => {
   const requestDjiCloudSync = useCallback(async () => {
     try {
       setDjiCloudSaving(true);
-      const response = await apiFetch<DjiCloudStatus & { message?: string }>("/api/dji-cloud/sync", {
+      const response = await apiFetch<DjiCloudStatus & { message?: string }>("/api/dji-smartfarm/pilot/sync", {
         method: "POST",
         body: JSON.stringify({}),
       });
@@ -3502,7 +3522,7 @@ const removeEvidence = useCallback((id: string) => {
   const disconnectDjiCloud = useCallback(async () => {
     try {
       setDjiCloudSaving(true);
-      const response = await apiFetch<DjiCloudStatus & { message?: string }>("/api/dji-cloud/disconnect", {
+      const response = await apiFetch<DjiCloudStatus & { message?: string }>("/api/dji-smartfarm/pilot/disconnect", {
         method: "POST",
         body: JSON.stringify({}),
       });
@@ -3526,7 +3546,7 @@ const removeEvidence = useCallback((id: string) => {
   }, []);
 
   useEffect(() => {
-    if (section === "dji-cloud") {
+    if (section === "dji-cloud" || section === "flight-log") {
       loadDjiCloudStatus().catch(() => {});
     }
   }, [section, loadDjiCloudStatus]);
@@ -5074,7 +5094,7 @@ const finalizeOperation = useCallback(async () => {
     Toast.show({ type: "info", text1: "Finalización provisional", text2: "Adjunta evidencias; todo se enviará al recuperar conexión." });
     return;
   }
-  apiFetch<{ ok?: boolean; flujo?: FlujoOperacionApi }>(`/api/misiones/${operationMission._id}/flujo-operacion/finalizar`, {
+  apiFetch<{ ok?: boolean; flujo?: FlujoOperacionApi; djiSync?: { associated?: number; pending?: number; detected?: number; source?: string } }>(`/api/misiones/${operationMission._id}/flujo-operacion/finalizar`, {
     method: "PATCH",
     body: JSON.stringify({ rutaGps }),
   })
@@ -5089,7 +5109,11 @@ const finalizeOperation = useCallback(async () => {
       Toast.show({
         type: "info",
         text1: "Cierre de operación",
-        text2: "Adjunta evidencias para marcar la misión como cumplida.",
+        text2: Number(r?.djiSync?.associated || 0) > 0
+          ? `Se asociaron ${r?.djiSync?.associated} vuelo(s) DJI. Adjunta las evidencias.`
+          : Number(r?.djiSync?.pending || 0) > 0
+          ? `${r?.djiSync?.pending} vuelo(s) DJI requieren confirmación.`
+          : "Operación finalizada. DJI seguirá disponible para sincronizar los vuelos.",
       });
     })
     .catch((e) => {
@@ -9950,7 +9974,7 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                       </View>
                     </View>
                     <Text style={styles.muted}>
-                      Ingresa las credenciales DJI del piloto para vincular la cuenta y después solicitar la sincronización desde la plataforma.
+                      Elige si tus vuelos se consultan desde la cuenta compartida de la empresa o desde tu cuenta DJI personal.
                     </Text>
                     {djiCloudLoading ? (
                       <View style={styles.loadingBox}>
@@ -9960,7 +9984,35 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                     ) : null}
                   </View>
 
-                    {djiIntegrationMode === "consumer_local" && (
+                  <View style={styles.card}>
+                    <Text style={styles.cardTitle}>Fuente de los vuelos</Text>
+                    <Text style={styles.muted}>Puedes cambiarla después. Si la cuenta personal no devuelve vuelos, el cierre podrá usar la cuenta empresarial como respaldo.</Text>
+                    <View style={{ flexDirection: "row", marginTop: 14 }}>
+                      <Pressable
+                        style={[djiCloudStatus?.syncSource !== "personal" ? styles.btnPrimary : styles.btnOutline, { flex: 1, justifyContent: "center", marginRight: 8, opacity: djiCloudSaving || !djiCloudStatus?.companyAccountAvailable ? 0.6 : 1 }]}
+                        disabled={djiCloudSaving || !djiCloudStatus?.companyAccountAvailable}
+                        onPress={() => saveDjiSyncSource("company")}
+                      >
+                        <MaterialCommunityIcons name="office-building-cog-outline" size={17} color={djiCloudStatus?.syncSource !== "personal" ? "#fff" : "#111918"} />
+                        <Text style={djiCloudStatus?.syncSource !== "personal" ? styles.btnPrimaryText : styles.btnOutlineText}>Cuenta empresa</Text>
+                      </Pressable>
+                      <Pressable
+                        style={[djiCloudStatus?.syncSource === "personal" ? styles.btnPrimary : styles.btnOutline, { flex: 1, justifyContent: "center", opacity: djiCloudSaving ? 0.6 : 1 }]}
+                        disabled={djiCloudSaving}
+                        onPress={() => saveDjiSyncSource("personal")}
+                      >
+                        <MaterialCommunityIcons name="account-outline" size={17} color={djiCloudStatus?.syncSource === "personal" ? "#fff" : "#111918"} />
+                        <Text style={djiCloudStatus?.syncSource === "personal" ? styles.btnPrimaryText : styles.btnOutlineText}>Mi cuenta DJI</Text>
+                      </Pressable>
+                    </View>
+                    <Text style={[styles.muted, { marginTop: 10 }]}>
+                      {djiCloudStatus?.syncSource === "personal"
+                        ? djiCloudStatus?.personalAccountConnected ? `Cuenta personal conectada: ${djiCloudStatus?.accountIdentifier || "DJI"}` : "Conecta tu cuenta DJI para activar esta fuente."
+                        : djiCloudStatus?.companyAccountAvailable ? `Cuenta empresarial disponible: ${djiCloudStatus?.companyAccountIdentifier || "DJI SmartFarm"}` : "El jefe de pilotos debe conectar primero la cuenta empresarial."}
+                    </Text>
+                  </View>
+
+                    {djiIntegrationMode === "consumer_local" && djiCloudStatus?.syncSource === "personal" && (
                       <View style={styles.card}>
                         <View style={styles.rowBetween}>
                           <Text style={styles.cardTitle}>Cuenta DJI</Text>
@@ -11429,6 +11481,54 @@ const saveEvidenceAndFinishMission = useCallback(async () => {
                       <Pressable style={styles.btnOutline} onPress={generarCertificadoHorasUI}>
                         <Ionicons name="time-outline" size={16} color="#111918" />
                         <Text style={styles.btnOutlineText}>Total Horas</Text>
+                      </Pressable>
+                    </View>
+                  </View>
+
+                  <View style={[styles.card, { marginBottom: 12 }]}>
+                    <View style={styles.rowBetween}>
+                      <View style={{ flex: 1, paddingRight: 10 }}>
+                        <Text style={styles.cardTitle}>Sincronización DJI</Text>
+                        <Text style={styles.muted}>
+                          Vincula la cuenta de la empresa o tu cuenta DJI para asociar automáticamente los logs a las misiones finalizadas.
+                        </Text>
+                      </View>
+                      <View
+                        style={[
+                          styles.statusBadge,
+                          (djiCloudStatus?.syncSource !== "personal" && djiCloudStatus?.companyAccountAvailable) ||
+                          (djiCloudStatus?.syncSource === "personal" && djiCloudStatus?.personalAccountConnected)
+                            ? styles.statusBadgeSuccess
+                            : styles.statusBadgeWarn,
+                        ]}
+                      >
+                        <Text style={styles.statusBadgeText}>
+                          {(djiCloudStatus?.syncSource !== "personal" && djiCloudStatus?.companyAccountAvailable) ||
+                          (djiCloudStatus?.syncSource === "personal" && djiCloudStatus?.personalAccountConnected)
+                            ? "CONECTADA"
+                            : "PENDIENTE"}
+                        </Text>
+                      </View>
+                    </View>
+
+                    <View style={[styles.rowBetween, { marginTop: 12 }]}>
+                      <View style={{ flex: 1, paddingRight: 10 }}>
+                        <Text style={styles.kLabel}>
+                          {djiCloudStatus?.syncSource === "personal" ? "Mi cuenta DJI" : "Cuenta de la empresa"}
+                        </Text>
+                        <Text style={styles.muted} numberOfLines={2}>
+                          {djiCloudStatus?.syncSource === "personal"
+                            ? djiCloudStatus?.personalAccountConnected
+                              ? djiCloudStatus?.accountIdentifier || "Cuenta personal conectada"
+                              : "Falta vincular tu cuenta DJI"
+                            : djiCloudStatus?.companyAccountAvailable
+                              ? djiCloudStatus?.companyAccountIdentifier || "DJI SmartFarm empresarial"
+                              : "El jefe de pilotos aún no ha conectado la cuenta empresarial"}
+                        </Text>
+                      </View>
+                      <Pressable style={styles.btnPrimary} onPress={() => goSection("dji-cloud")}>
+                        <Ionicons name="sync-outline" size={16} color="#fff" />
+                        <Text style={styles.btnPrimaryText}>Configurar</Text>
                       </Pressable>
                     </View>
                   </View>
